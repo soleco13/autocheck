@@ -1,0 +1,61 @@
+# Dependencies
+node_modules/
+.venv/
+
+# Environment variables (contain secrets)
+.env
+.env.local
+.env.production
+
+# Build output
+frontend/dist/
+backend/dist/
+
+# Logs
+*.log
+backend/server.log
+backend-dev.log
+backend-dev-err.log
+backend-test.log
+backend-test-err.log
+
+# IDE
+.idea/
+.vscode/
+
+# Debug/test artifacts at root
+ddp-spy*.mjs
+ddp-spy-log*.json
+screenshot-*.mjs
+screenshot-*.png
+
+# Screenshots / images (debugging artifacts)
+ss-*.png
+ss2-*.png
+ss3-*.png
+v3-*.png
+final-*.png
+
+# Redis binaries (Windows)
+redis/*.exe
+redis/*.pdb
+redis/*.dll
+redis/*.zip
+redis/*.docx
+
+# Misc root-level test files
+b1.json
+b2.json
+t1.json
+t2.json
+t3.json
+t4.json
+t5.json
+t6.json
+t7.json
+t8.json
+tc.json
+tt.json
+old.json
+hdr.txt
+struct.txt
