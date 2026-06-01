@@ -4,7 +4,11 @@ import { encrypt, decrypt, hashPassword } from '../lib/encryption';
 import { loginTeacher as genaLogin } from '../ddp/gena-client';
 import { loginToEdik } from '../ddp/edik-client';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret';
+const JWT_SECRET: string = (() => {
+  const s = process.env.JWT_SECRET;
+  if (!s) throw new Error('JWT_SECRET env var is required but not set');
+  return s;
+})();
 const SESSION_TTL = 24 * 60 * 60; // 24 hours in seconds
 
 export interface TeacherSession {

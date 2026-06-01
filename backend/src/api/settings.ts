@@ -1,5 +1,6 @@
 import { Router, Response } from 'express';
 import { requireAuth, AuthRequest } from '../middleware/auth-middleware';
+import { safeError } from '../lib/safe-error';
 import { db } from '../db';
 
 const router = Router();
@@ -53,7 +54,7 @@ router.get('/ai-usage', requireAuth, async (req: AuthRequest, res: Response) => 
       },
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -75,7 +76,7 @@ router.get('/ai-prompts', requireAuth, async (req: AuthRequest, res: Response) =
     }
     res.json({ prompts, defaults: DEFAULT_PROMPTS });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -107,7 +108,7 @@ router.post('/ai-prompts', requireAuth, async (req: AuthRequest, res: Response) 
     }
     res.json({ ok: true });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 

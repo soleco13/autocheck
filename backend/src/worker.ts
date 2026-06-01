@@ -40,7 +40,12 @@ export function startCheckWorker(): Worker<CheckJobData> {
       );
       return { sessionId, reportId };
     },
-    { connection: getRedis() as any, concurrency: WORKER_CONCURRENCY },
+    {
+      connection: getRedis() as any,
+      concurrency: WORKER_CONCURRENCY,
+      // If a job holds the lock for more than 10 min it's considered stalled and retried
+      lockDuration: 10 * 60_000,
+    },
   );
 
   worker.on('failed', async (job, err) => {

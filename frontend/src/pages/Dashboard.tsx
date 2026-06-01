@@ -1,90 +1,99 @@
 import { useState, useMemo } from 'react'
-import { Link } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  Users, RefreshCw, AlertTriangle, Search,
-  ChevronDown, ChevronRight, Grid2x2, List,
-} from 'lucide-react'
+import { Users, RefreshCw, AlertTriangle, Search, Grid2x2, List, ChevronRight, X } from 'lucide-react'
 import { getStudents, syncClassrooms } from '../api/client'
-import { SkeletonDashboard } from '../components/Skeleton'
 import { toast } from '../components/Toast'
 
-type GroupBy = 'none' | 'grade' | 'classroom'
-type ViewMode = 'grid' | 'list'
+function SkelLine({ w = '100%', h = 14, mb = 0 }: { w?: string | number; h?: number; mb?: number }) {
+  return <div className="skeleton" style={{ width: w, height: h, marginBottom: mb, borderRadius: 8 }} />
+}
+
+function StudentGridCard({ student, onClick }: { student: any; onClick: () => void }) {
+  const initials = (student.full_name || '?').split(' ').map((w: string) => w[0]).slice(0, 2).join('')
+  const classrooms: string[] = student.classrooms ?? []
+
+  return (
+    <button onClick={onClick} className="card card-pad"
+      style={{ textAlign: 'left', cursor: 'pointer', border: '1px solid var(--c-border-solid)', transition: 'all 0.18s', display: 'block', width: '100%' }}
+      onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = 'var(--shadow-md)'; el.style.transform = 'translateY(-2px)'; el.style.borderColor = 'var(--c-primary-muted)' }}
+      onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.boxShadow = ''; el.style.transform = ''; el.style.borderColor = 'var(--c-border-solid)' }}>
+
+      {/* Avatar + name */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: classrooms.length > 0 ? 14 : 0 }}>
+        <div className="avatar" style={{ width: 50, height: 50, fontSize: 19, flexShrink: 0 }}>{initials}</div>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 15.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {student.full_name}
+          </div>
+          <div style={{ fontSize: 13, color: 'var(--c-text-3)', marginTop: 2 }}>
+            {student.grade ? `${student.grade} класс` : 'Класс не указан'}
+          </div>
+        </div>
+      </div>
+
+      {/* Classrooms as tags */}
+      {classrooms.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {classrooms.slice(0, 3).map(c => (
+            <span key={c} style={{
+              fontSize: 12, fontWeight: 600, color: 'var(--c-teal)',
+              background: 'var(--c-teal-light)', padding: '3px 10px', borderRadius: 99,
+              whiteSpace: 'nowrap', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis',
+            }}>{c}</span>
+          ))}
+          {classrooms.length > 3 && (
+            <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--c-text-3)', background: 'var(--c-surface-3)', padding: '3px 10px', borderRadius: 99 }}>
+              +{classrooms.length - 3}
+            </span>
+          )}
+        </div>
+      )}
+    </button>
+  )
+}
 
 export default function Dashboard() {
+  const navigate = useNavigate()
   const qc = useQueryClient()
   const [syncing, setSyncing] = useState(false)
   const [syncingClassrooms, setSyncingClassrooms] = useState(false)
   const [search, setSearch] = useState('')
-  const [groupBy, setGroupBy] = useState<GroupBy>('classroom')
-  const [viewMode, setViewMode] = useState<ViewMode>('grid')
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
+  const [classroomFilter, setClassroomFilter] = useState('')
+  const [gradeFilter, setGradeFilter] = useState('')
+  const [view, setView] = useState<'grid' | 'list'>('grid')
 
-  const { data: students = [], isLoading, error } = useQuery({
+  const { data: students = [], isLoading } = useQuery({
     queryKey: ['students'],
     queryFn: () => getStudents(),
     staleTime: 30_000,
   })
 
+  const allStudents = students as any[]
+
+  // Unique sorted classrooms from platform data
+  const classrooms = useMemo(() => {
+    const set = new Set<string>()
+    allStudents.forEach(s => (s.classrooms ?? []).forEach((c: string) => set.add(c)))
+    return [...set].sort((a, b) => a.localeCompare(b, 'ru', { numeric: true }))
+  }, [allStudents])
+
+  // Unique grades
+  const grades = useMemo(() =>
+    [...new Set(allStudents.map(s => s.grade).filter(Boolean))].sort((a, b) => a - b),
+    [allStudents])
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
-    if (!q) return students as any[]
-    return (students as any[]).filter(s => s.full_name?.toLowerCase().includes(q))
-  }, [students, search])
-
-  const groups = useMemo(() => {
-    if (groupBy === 'none') return [{ key: 'all', label: null, items: filtered }]
-
-    if (groupBy === 'classroom') {
-      // Group by first classroom name (from platform sync)
-      const map = new Map<string, any[]>()
-      for (const s of filtered) {
-        const classrooms: string[] = s.classrooms || []
-        if (classrooms.length === 0) {
-          const k = 'Без класса'
-          if (!map.has(k)) map.set(k, [])
-          map.get(k)!.push(s)
-        } else {
-          // Student can appear in multiple classrooms — add to first one only
-          const k = classrooms[0]
-          if (!map.has(k)) map.set(k, [])
-          map.get(k)!.push(s)
-        }
-      }
-      return Array.from(map.entries())
-        .map(([key, items]) => ({ key, label: key, items }))
-        .sort((a, b) => {
-          if (a.key === 'Без класса') return 1
-          if (b.key === 'Без класса') return -1
-          return a.key.localeCompare(b.key, 'ru', { numeric: true })
-        })
-    }
-
-    // Group by grade number
-    const map = new Map<string, any[]>()
-    for (const s of filtered) {
-      const k = s.grade ? `${s.grade} класс` : 'Без класса'
-      if (!map.has(k)) map.set(k, [])
-      map.get(k)!.push(s)
-    }
-    return Array.from(map.entries())
-      .map(([key, items]) => ({ key, label: key, items }))
-      .sort((a, b) => {
-        if (a.key === 'Без класса') return 1
-        if (b.key === 'Без класса') return -1
-        const na = parseInt(a.key), nb = parseInt(b.key)
-        if (!isNaN(na) && !isNaN(nb)) return na - nb
-        return a.key.localeCompare(b.key, 'ru', { numeric: true })
-      })
-  }, [filtered, groupBy])
-
-  const toggleGroup = (key: string) =>
-    setCollapsedGroups(prev => {
-      const n = new Set(prev)
-      if (n.has(key)) n.delete(key); else n.add(key)
-      return n
+    return allStudents.filter(s => {
+      if (q && !s.full_name?.toLowerCase().includes(q)) return false
+      if (classroomFilter && !(s.classrooms ?? []).includes(classroomFilter)) return false
+      if (gradeFilter && String(s.grade) !== gradeFilter) return false
+      return true
     })
+  }, [allStudents, search, classroomFilter, gradeFilter])
+
+  const hasClassrooms = allStudents.some(s => s.classrooms?.length > 0)
 
   const handleSync = async () => {
     setSyncing(true)
@@ -95,9 +104,7 @@ export default function Dashboard() {
     } catch (err: any) {
       toast.error(err.response?.data?.error || err.message || 'Ошибка синхронизации')
       qc.invalidateQueries({ queryKey: ['students'] })
-    } finally {
-      setSyncing(false)
-    }
+    } finally { setSyncing(false) }
   }
 
   const handleSyncClassrooms = async () => {
@@ -105,224 +112,181 @@ export default function Dashboard() {
     try {
       const result = await syncClassrooms()
       qc.invalidateQueries({ queryKey: ['students'] })
-      if (result.error) {
-        toast.error(`Классы: ${result.error}`)
-      } else {
-        toast.success(`Классы синхронизированы: ${result.synced} групп`)
-      }
+      if (result.error) toast.error(`Классы: ${result.error}`)
+      else toast.success(`Классы синхронизированы: ${result.synced} групп`)
     } catch (err: any) {
       toast.error(err.response?.data?.error || err.message || 'Ошибка синхронизации классов')
-    } finally {
-      setSyncingClassrooms(false)
-    }
+    } finally { setSyncingClassrooms(false) }
   }
 
-  const total = (students as any[]).length
-  const hasClassrooms = (students as any[]).some(s => s.classrooms?.length > 0)
+  const resetFilters = () => { setSearch(''); setClassroomFilter(''); setGradeFilter('') }
+  const hasFilters = !!(search || classroomFilter || gradeFilter)
 
   return (
-    <div>
-      {error && (
-        <div className="card p-4 mb-5" style={{ borderColor: '#fecaca', background: 'var(--c-danger-light)' }}>
-          <div style={{ display: 'flex', gap: 10 }}>
-            <AlertTriangle size={16} color="var(--c-danger)" style={{ flexShrink: 0, marginTop: 2 }} />
-            <div>
-              <p style={{ margin: 0, fontWeight: 600, color: 'var(--c-danger)' }}>Ошибка загрузки</p>
-              <p style={{ margin: '4px 0 0', fontSize: 13, color: 'var(--c-text-2)', fontFamily: 'monospace' }}>
-                {(error as any)?.message}
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Header */}
+    <div className="content-max fade-in">
       <div className="page-header">
         <div>
-          <h1 className="page-title">Мои ученики</h1>
+          <h1 className="page-title">Ученики</h1>
           {!isLoading && (
             <p className="page-subtitle">
-              {filtered.length !== total ? `${filtered.length} из ${total}` : `${total} учеников`}
-              {hasClassrooms && <span style={{ color: 'var(--c-text-3)' }}> · {groups.filter(g => g.label && g.key !== 'Без класса').length} групп</span>}
+              {filtered.length !== allStudents.length
+                ? `${filtered.length} из ${allStudents.length}`
+                : `${allStudents.length} учеников`}
+              {hasClassrooms && ` · ${classrooms.length} групп`}
             </p>
           )}
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <div className="search-wrap" style={{ width: 220 }}>
-            <span className="search-icon"><Search size={14} /></span>
-            <input
-              className="input input-search"
-              placeholder="Поиск по имени..."
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              style={{ height: 36 }}
-            />
-          </div>
-
-          <select
-            value={groupBy}
-            onChange={e => setGroupBy(e.target.value as GroupBy)}
-            className="input"
-            style={{ width: 'auto', height: 36, paddingTop: 4, paddingBottom: 4 }}
-          >
-            <option value="classroom">По классу (платформа)</option>
-            <option value="grade">По номеру класса</option>
-            <option value="none">Без группировки</option>
-          </select>
-
-          {/* View mode toggle */}
-          <div style={{ display: 'flex', border: '1px solid var(--c-border-solid)', borderRadius: 8, overflow: 'hidden' }}>
-            <button
-              onClick={() => setViewMode('grid')}
-              style={{
-                padding: '7px 10px', border: 'none', cursor: 'pointer',
-                background: viewMode === 'grid' ? 'var(--c-primary)' : 'var(--c-surface)',
-                color: viewMode === 'grid' ? '#fff' : 'var(--c-text-2)',
-              }}
-              title="Сетка"
-            >
+          <div className="segmented">
+            <button className={view === 'grid' ? 'active' : ''} onClick={() => setView('grid')} title="Сетка">
               <Grid2x2 size={15} />
             </button>
-            <button
-              onClick={() => setViewMode('list')}
-              style={{
-                padding: '7px 10px', border: 'none', cursor: 'pointer',
-                background: viewMode === 'list' ? 'var(--c-primary)' : 'var(--c-surface)',
-                color: viewMode === 'list' ? '#fff' : 'var(--c-text-2)',
-              }}
-              title="Список"
-            >
+            <button className={view === 'list' ? 'active' : ''} onClick={() => setView('list')} title="Список">
               <List size={15} />
             </button>
           </div>
-
-          <button onClick={handleSync} disabled={syncing} className="btn btn-secondary" style={{ height: 36 }}>
+          <button onClick={handleSync} disabled={syncing} className="btn btn-secondary btn-sm">
             <RefreshCw size={14} style={{ animation: syncing ? 'spin 0.7s linear infinite' : undefined }} />
-            {syncing ? 'Синхронизация...' : 'Учеников'}
+            {syncing ? 'Синхронизация...' : 'Обновить'}
           </button>
-
-          <button onClick={handleSyncClassrooms} disabled={syncingClassrooms} className="btn btn-secondary" style={{ height: 36 }}>
+          <button onClick={handleSyncClassrooms} disabled={syncingClassrooms} className="btn btn-secondary btn-sm">
             <RefreshCw size={14} style={{ animation: syncingClassrooms ? 'spin 0.7s linear infinite' : undefined }} />
-            {syncingClassrooms ? 'Загрузка...' : 'Классы'}
+            {syncingClassrooms ? 'Загрузка...' : 'Синхр. классы'}
           </button>
         </div>
       </div>
 
-      {/* No classrooms hint */}
-      {!isLoading && !hasClassrooms && groupBy === 'classroom' && (
-        <div className="card p-4 mb-5" style={{ borderColor: '#fde68a', background: 'var(--c-warn-light)' }}>
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-            <AlertTriangle size={15} color="var(--c-warn)" style={{ flexShrink: 0 }} />
-            <span style={{ fontSize: 14, color: '#92400e' }}>
-              Классы не загружены. Нажмите{' '}
-              <button onClick={handleSyncClassrooms} disabled={syncingClassrooms} style={{ fontWeight: 700, color: 'var(--c-warn)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontSize: 'inherit', textDecoration: 'underline' }}>
-                «Классы»
-              </button>{' '}
-              для синхронизации с платформой.
-            </span>
+      {/* Filter bar */}
+      <div className="card" style={{ padding: 16, marginBottom: 18 }}>
+        <div className="filter-bar">
+          <div className="search-wrap" style={{ flex: 1, minWidth: 200 }}>
+            <span className="search-icon"><Search size={17} /></span>
+            <input className="input input-search" placeholder="Поиск по имени…" value={search}
+              onChange={e => setSearch(e.target.value)} />
+            {search && <button className="search-clear" onClick={() => setSearch('')}><X size={15} /></button>}
+          </div>
+
+          {/* Classroom filter — main filter from platform */}
+          {classrooms.length > 0 && (
+            <select className="input" style={{ width: 'auto', maxWidth: 220 }}
+              value={classroomFilter} onChange={e => setClassroomFilter(e.target.value)}>
+              <option value="">Все группы ({allStudents.length})</option>
+              {classrooms.map(c => {
+                const cnt = allStudents.filter(s => (s.classrooms ?? []).includes(c)).length
+                return <option key={c} value={c}>{c} ({cnt})</option>
+              })}
+            </select>
+          )}
+
+          {/* Grade filter */}
+          {grades.length > 0 && (
+            <select className="input" style={{ width: 'auto' }}
+              value={gradeFilter} onChange={e => setGradeFilter(e.target.value)}>
+              <option value="">Все классы</option>
+              {grades.map(g => <option key={g} value={String(g)}>{g} класс</option>)}
+            </select>
+          )}
+
+          {hasFilters && (
+            <button onClick={resetFilters} className="btn btn-ghost btn-sm">
+              <X size={13} /> Сбросить
+            </button>
+          )}
+
+          <div style={{ marginLeft: 'auto', fontSize: 14, color: 'var(--c-text-3)', fontWeight: 600 }}>
+            {filtered.length}
           </div>
         </div>
-      )}
+      </div>
 
       {/* Student list */}
       {isLoading ? (
-        <SkeletonDashboard count={9} />
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+          {Array.from({ length: 9 }).map((_, i) => (
+            <div key={i} className="card card-pad">
+              <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 14 }}>
+                <SkelLine w={50} h={50} />
+                <div style={{ flex: 1 }}><SkelLine w="70%" h={14} mb={6} /><SkelLine w="40%" h={12} /></div>
+              </div>
+              <SkelLine w="80%" h={22} />
+            </div>
+          ))}
+        </div>
       ) : filtered.length === 0 ? (
         <div className="card empty-state">
           <div className="empty-state-icon"><Users size={40} /></div>
           <p style={{ fontWeight: 600, margin: '0 0 6px' }}>
-            {search ? 'Ученик не найден' : 'Список учеников пуст'}
+            {hasFilters ? 'Ничего не найдено' : 'Список учеников пуст'}
           </p>
           <p style={{ margin: 0, fontSize: 13, color: 'var(--c-text-3)' }}>
-            {search ? 'Попробуйте другой запрос' : 'Нажмите «Учеников» для синхронизации с платформой'}
+            {hasFilters ? 'Попробуйте изменить фильтры' : 'Нажмите «Обновить» для синхронизации с платформой'}
           </p>
         </div>
+      ) : view === 'grid' ? (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+          {filtered.map((s: any) => (
+            <StudentGridCard key={s.id} student={s} onClick={() => navigate(`/students/${s.id}`)} />
+          ))}
+        </div>
       ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: groupBy === 'none' ? 0 : 20 }}>
-          {groups.map(({ key, label, items }) => {
-            const isCollapsed = collapsedGroups.has(key)
-            return (
-              <div key={key}>
-                {/* Group header */}
-                {label && (
-                  <div
-                    style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10, cursor: 'pointer', userSelect: 'none' }}
-                    onClick={() => toggleGroup(key)}
-                  >
-                    {isCollapsed
-                      ? <ChevronRight size={15} color="var(--c-text-3)" />
-                      : <ChevronDown size={15} color="var(--c-text-3)" />
-                    }
-                    <span style={{ fontWeight: 700, fontSize: 15, color: 'var(--c-text)' }}>{label}</span>
-                    <span className="badge badge-gray">{items.length}</span>
-                    <div style={{ flex: 1, height: 1, background: 'var(--c-border-solid)' }} />
-                  </div>
-                )}
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Ученик</th>
+                <th style={{ width: 100 }}>Класс</th>
+                <th>Группы с платформы</th>
+                <th style={{ width: 40 }}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((s: any) => {
+                const initials = (s.full_name || '?').split(' ').map((w: string) => w[0]).slice(0, 2).join('')
+                const cls: string[] = s.classrooms ?? []
+                return (
+                  <tr key={s.id} style={{ cursor: 'pointer' }} onClick={() => navigate(`/students/${s.id}`)}>
+                    <td>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                        <div className="avatar" style={{ width: 38, height: 38, fontSize: 14, flexShrink: 0 }}>{initials}</div>
+                        <span style={{ fontWeight: 600 }}>{s.full_name}</span>
+                      </div>
+                    </td>
+                    <td>
+                      {s.grade ? <span className="badge badge-gray">{s.grade} кл.</span> : <span style={{ color: 'var(--c-text-3)' }}>—</span>}
+                    </td>
+                    <td>
+                      <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                        {cls.length > 0
+                          ? cls.slice(0, 3).map(c => (
+                            <span key={c} style={{ fontSize: 12, fontWeight: 600, color: 'var(--c-teal)', background: 'var(--c-teal-light)', padding: '2px 9px', borderRadius: 99 }}>{c}</span>
+                          ))
+                          : <span style={{ color: 'var(--c-text-3)', fontSize: 13 }}>—</span>}
+                        {cls.length > 3 && <span style={{ fontSize: 12, color: 'var(--c-text-3)' }}>+{cls.length - 3}</span>}
+                      </div>
+                    </td>
+                    <td style={{ textAlign: 'right' }}>
+                      <ChevronRight size={18} color="var(--c-text-3)" />
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
 
-                {/* Students */}
-                {!isCollapsed && (
-                  viewMode === 'grid' ? (
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 10 }}>
-                      {items.map((student: any) => (
-                        <Link key={student.id} to={`/students/${student.id}`} style={{ textDecoration: 'none' }}>
-                          <div
-                            className="card"
-                            style={{ padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', transition: 'box-shadow var(--transition), border-color var(--transition)' }}
-                            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.boxShadow = 'var(--shadow-md)'; (e.currentTarget as HTMLElement).style.borderColor = 'var(--c-primary-muted)' }}
-                            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.boxShadow = 'var(--shadow-sm)'; (e.currentTarget as HTMLElement).style.borderColor = 'var(--c-border-solid)' }}
-                          >
-                            <div className="avatar" style={{ width: 40, height: 40, flexShrink: 0 }}>
-                              {student.full_name?.charAt(0) || '?'}
-                            </div>
-                            <div style={{ flex: 1, minWidth: 0 }}>
-                              <p style={{ margin: 0, fontWeight: 600, color: 'var(--c-text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontSize: 14 }}>
-                                {student.full_name}
-                              </p>
-                              {student.grade && groupBy !== 'classroom' && (
-                                <p style={{ margin: '2px 0 0', fontSize: 12, color: 'var(--c-text-3)' }}>
-                                  {student.grade} класс
-                                </p>
-                              )}
-                              {student.classrooms?.length > 0 && groupBy === 'classroom' && student.classrooms.length > 1 && (
-                                <p style={{ margin: '2px 0 0', fontSize: 11, color: 'var(--c-text-3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                  +{student.classrooms.length - 1} ещё
-                                </p>
-                              )}
-                            </div>
-                          </div>
-                        </Link>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="table-wrap">
-                      <table className="data-table">
-                        <tbody>
-                          {items.map((student: any) => (
-                            <tr key={student.id} style={{ cursor: 'pointer' }} onClick={() => window.location.href = `/students/${student.id}`}>
-                              <td>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                                  <div className="avatar" style={{ width: 32, height: 32, flexShrink: 0, fontSize: 13 }}>
-                                    {student.full_name?.charAt(0) || '?'}
-                                  </div>
-                                  <span style={{ fontWeight: 500 }}>{student.full_name}</span>
-                                </div>
-                              </td>
-                              <td style={{ width: 120, color: 'var(--c-text-2)', fontSize: 13 }}>
-                                {student.grade ? `${student.grade} класс` : '—'}
-                              </td>
-                              <td style={{ width: 200, fontSize: 13, color: 'var(--c-text-3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                {student.classrooms?.join(', ') || '—'}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )
-                )}
-              </div>
-            )
-          })}
+      {!isLoading && !hasClassrooms && (
+        <div className="card" style={{ marginTop: 18, padding: '14px 18px', borderColor: '#fde68a', background: 'var(--c-warn-light)' }}>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <AlertTriangle size={15} color="var(--c-warn)" style={{ flexShrink: 0 }} />
+            <span style={{ fontSize: 14, color: '#92400e' }}>
+              Группы с платформы не загружены.{' '}
+              <button onClick={handleSyncClassrooms} disabled={syncingClassrooms}
+                style={{ fontWeight: 700, color: 'var(--c-warn)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, textDecoration: 'underline' }}>
+                Синхронизировать
+              </button>
+            </span>
+          </div>
         </div>
       )}
     </div>

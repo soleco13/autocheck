@@ -1,11 +1,30 @@
 import { Router, Response } from 'express';
 import { requireAuth, AuthRequest } from '../middleware/auth-middleware';
+import { safeError } from '../lib/safe-error';
 import { db } from '../db';
 import { syncStudentsForTeacher, syncClassroomsForTeacher } from '../services/session-fetcher';
 import { getDecryptedToken } from '../services/auth';
 import { getChildsMaterials, getMaterialTitleMap } from '../ddp/gena-client';
 
 const router = Router();
+
+// In-memory LRU cache for platform works data per (teacher, student)
+// TTL: 5 minutes, max 500 entries — prevents unbounded memory growth
+const worksCache = new Map<string, { data: any; at: number }>();
+const WORKS_TTL = 5 * 60_000;
+const WORKS_CACHE_MAX = 500;
+
+function worksCacheSet(key: string, value: { data: any; at: number }) {
+  if (worksCache.size >= WORKS_CACHE_MAX && !worksCache.has(key)) {
+    worksCache.delete(worksCache.keys().next().value!);  // evict oldest (Map is insertion-ordered)
+  }
+  worksCache.set(key, value);
+  // Periodic TTL cleanup every 50 writes
+  if (worksCache.size % 50 === 0) {
+    const now = Date.now();
+    for (const [k, v] of worksCache) if (now - v.at > WORKS_TTL) worksCache.delete(k);
+  }
+}
 
 router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   let syncError: string | null = null;
@@ -20,32 +39,33 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   }
 
   try {
-    // Return students with their classroom names (from platform sync).
-    // Grade: from students table if set; else from most recent session's control_sheet.
+    // Use CTEs instead of correlated subqueries — avoids N×2 per-row lookups for 200+ students.
     const result = await db.query(`
+      WITH grade_cte AS (
+        SELECT DISTINCT ON (ss.student_id)
+          ss.student_id,
+          cs.grade
+        FROM student_sessions ss
+        JOIN control_sheets cs ON cs.id = ss.control_sheet_id
+        WHERE ss.teacher_id = $1 AND cs.grade > 0
+        ORDER BY ss.student_id, ss.fetched_at DESC
+      ),
+      classroom_cte AS (
+        SELECT crs.student_id,
+               ARRAY_AGG(cr.name ORDER BY cr.name) AS classrooms
+        FROM classroom_students crs
+        JOIN classrooms cr ON cr.id = crs.classroom_id
+        WHERE cr.teacher_id = $1
+        GROUP BY crs.student_id
+      )
       SELECT
         s.id, s.platform_student_id, s.full_name, s.nickname, s.cached_at,
-        COALESCE(
-          NULLIF(s.grade, 0),
-          (
-            SELECT cs.grade
-            FROM student_sessions ss
-            JOIN control_sheets cs ON cs.id = ss.control_sheet_id
-            WHERE ss.student_id = s.id
-              AND ss.teacher_id = $1
-              AND cs.grade > 0
-            ORDER BY ss.fetched_at DESC
-            LIMIT 1
-          )
-        ) AS grade,
-        (
-          SELECT ARRAY_AGG(cr.name ORDER BY cr.name)
-          FROM classroom_students crs
-          JOIN classrooms cr ON cr.id = crs.classroom_id
-          WHERE crs.student_id = s.id AND cr.teacher_id = $1
-        ) AS classrooms
+        COALESCE(NULLIF(s.grade, 0), gc.grade) AS grade,
+        COALESCE(cc.classrooms, ARRAY[]::text[]) AS classrooms
       FROM students s
       JOIN teacher_students ts ON ts.student_id = s.id
+      LEFT JOIN grade_cte gc ON gc.student_id = s.id
+      LEFT JOIN classroom_cte cc ON cc.student_id = s.id
       WHERE ts.teacher_id = $1
       ORDER BY s.full_name
     `, [req.teacherId]);
@@ -53,7 +73,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
     res.json(result.rows);
   } catch (err: any) {
     console.error('Get students DB error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -72,6 +92,7 @@ router.get('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
 });
 
 router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) => {
+  const forceRefresh = req.query.refresh === 'true';
   try {
     // Already-checked sessions from DB (include jwt_token for Edik viewer link)
     const sessionsResult = await db.query(`
@@ -92,6 +113,13 @@ router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) =>
     let platformExtras: any[] = [];
     let platformError: string | null = null;
 
+    // Check server-side cache for platform data (avoids repeated DDP calls)
+    const cacheKey = `${req.teacherId}:${req.params.id}`;
+    const cached = worksCache.get(cacheKey);
+    if (!forceRefresh && cached && Date.now() - cached.at < WORKS_TTL) {
+      platformExtras = cached.data.extras;
+      platformError = cached.data.error;
+    } else
     try {
       const [studentRow, teacherRow] = await Promise.all([
         db.query('SELECT platform_student_id FROM students WHERE id = $1', [req.params.id]),
@@ -148,10 +176,13 @@ router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) =>
       console.warn('[works] Platform fetch error:', err.message);
     }
 
+    // Store platform result in cache (even errors, to avoid hammering the platform)
+    worksCacheSet(cacheKey, { data: { extras: platformExtras, error: platformError }, at: Date.now() });
+
     res.json({ works: [...sessions, ...platformExtras], platformError });
   } catch (err: any) {
     console.error('Get works error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -160,7 +191,7 @@ router.post('/:id/sync', requireAuth, async (req: AuthRequest, res: Response) =>
     await syncStudentsForTeacher(req.teacherId!);
     res.json({ message: 'Students synced' });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -170,7 +201,7 @@ router.post('/sync-classrooms', requireAuth, async (req: AuthRequest, res: Respo
     const result = await syncClassroomsForTeacher(req.teacherId!);
     res.json(result);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 

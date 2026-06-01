@@ -1,28 +1,21 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import {
-  Settings as SettingsIcon, Zap, MessageSquare, RefreshCw,
-  CheckCircle, ChevronDown, ChevronUp, RotateCcw,
-} from 'lucide-react'
-import { getAiUsage, getAiPrompts, saveAiPrompt } from '../api/client'
-import { Skeleton } from '../components/Skeleton'
+import { Zap, MessageSquare, CheckCircle, RotateCcw, AlertTriangle, ChevronDown, ChevronUp, RefreshCw } from 'lucide-react'
+import { getAiUsage, getAiPrompts, saveAiPrompt, getMe } from '../api/client'
 import { toast } from '../components/Toast'
 
-const PROMPT_META: Record<string, { label: string; hint: string; icon: React.ReactNode }> = {
+const PROMPT_META: Record<string, { label: string; desc: string }> = {
   checker_system: {
     label: 'Системный промпт проверки',
-    hint: 'Инструкции ИИ-проверщику при оценке каждого ответа ученика. Используется моделью claude-haiku.',
-    icon: <Zap size={15} color="var(--c-primary)" />,
+    desc: 'Основные инструкции для ИИ при проверке работ (модель claude-haiku)',
   },
   report_student: {
-    label: 'Комментарий ученику',
-    hint: 'Промпт для генерации итогового комментария, который показывается ученику.',
-    icon: <MessageSquare size={15} color="var(--c-teal)" />,
+    label: 'Промпт комментария ученику',
+    desc: 'Как ИИ формулирует обратную связь для ученика',
   },
   report_teacher: {
-    label: 'Сводка для учителя',
-    hint: 'Промпт для генерации сводки, которую видит только учитель.',
-    icon: <MessageSquare size={15} color="var(--c-warn)" />,
+    label: 'Промпт рекомендаций учителю',
+    desc: 'Сводка и рекомендации для преподавателя',
   },
 }
 
@@ -32,335 +25,280 @@ function formatNum(n: number): string {
   return String(n)
 }
 
-function UsageBar({ label, value, max, color }: { label: string; value: number; max: number; color: string }) {
-  const pct = max > 0 ? Math.min(100, (value / max) * 100) : 0
+function SkelLine({ w = '100%', h = 14 }: { w?: string | number; h?: number }) {
+  return <div className="skeleton" style={{ width: w, height: h, borderRadius: 8 }} />
+}
+
+function ConfirmModal({ open, title, sub, onConfirm, onCancel }: { open: boolean; title: string; sub: string; onConfirm: () => void; onCancel: () => void }) {
+  if (!open) return null
   return (
-    <div style={{ marginBottom: 12 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5, fontSize: 13 }}>
-        <span style={{ color: 'var(--c-text-2)' }}>{label}</span>
-        <span style={{ fontWeight: 600 }}>{formatNum(value)}</span>
-      </div>
-      <div className="progress-bar" style={{ height: 6 }}>
-        <div
-          className="progress-bar-fill"
-          style={{ width: `${pct}%`, background: color, transition: 'width 0.6s ease' }}
-        />
+    <div className="modal-overlay" onClick={onCancel}>
+      <div className="modal" style={{ maxWidth: 520 }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: 28 }}>
+          <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start', marginBottom: 18 }}>
+            <span style={{ width: 44, height: 44, borderRadius: 12, background: 'var(--c-warn-light)', color: 'var(--c-warn)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+              <AlertTriangle size={22} />
+            </span>
+            <div>
+              <h3 style={{ fontSize: 18, fontWeight: 700, margin: '0 0 8px' }}>{title}</h3>
+              <p style={{ fontSize: 14, color: 'var(--c-text-2)', lineHeight: 1.55, margin: 0 }}>{sub}</p>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+            <button className="btn btn-ghost" onClick={onCancel}>Отмена</button>
+            <button className="btn btn-primary" onClick={onConfirm}>Да, сохранить</button>
+          </div>
+        </div>
       </div>
     </div>
   )
 }
 
-function PromptEditor({
-  promptKey,
-  defaultText,
-  savedText,
-  meta,
-}: {
-  promptKey: string
-  defaultText: string
-  savedText: string
-  meta: typeof PROMPT_META[string]
-}) {
+function PromptCard({ promptKey, defaultText, savedText }: { promptKey: string; defaultText: string; savedText: string }) {
   const [value, setValue] = useState(savedText)
   const [open, setOpen] = useState(false)
+  const [confirmOpen, setConfirmOpen] = useState(false)
   const qc = useQueryClient()
-  const isDirty = value !== savedText
+  const meta = PROMPT_META[promptKey] || { label: promptKey, desc: '' }
   const isCustom = savedText !== defaultText
+  const isDirty = value !== savedText
 
   const mutation = useMutation({
     mutationFn: (text: string) => saveAiPrompt(promptKey, text),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['ai-prompts'] })
-      toast.success('Промпт сохранён')
-    },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['ai-prompts'] }); toast.success('Промпт сохранён') },
     onError: () => toast.error('Ошибка сохранения'),
   })
 
-  const handleReset = () => {
-    setValue(defaultText)
-    mutation.mutate('')
-  }
+  useEffect(() => { setValue(savedText) }, [savedText])
 
-  useEffect(() => {
-    setValue(savedText)
-  }, [savedText])
+  const askSave = () => setConfirmOpen(true)
+  const doSave = () => { mutation.mutate(value); setConfirmOpen(false) }
+  const doReset = () => { setValue(defaultText); mutation.mutate('') }
 
   return (
-    <div className="card" style={{ overflow: 'hidden', border: isCustom ? '1px solid var(--c-primary-muted)' : '1px solid var(--c-border-solid)' }}>
-      {/* Header */}
-      <div
-        style={{
-          padding: '14px 16px',
-          display: 'flex', alignItems: 'center', gap: 12,
-          cursor: 'pointer', background: isCustom ? 'var(--c-primary-light)' : 'var(--c-surface)',
-          userSelect: 'none',
-        }}
-        onClick={() => setOpen(v => !v)}
-      >
-        <div style={{
-          width: 32, height: 32, borderRadius: 8,
-          background: 'rgba(255,255,255,0.8)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          border: '1px solid var(--c-border-solid)', flexShrink: 0,
-        }}>
-          {meta.icon}
-        </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontWeight: 600, fontSize: 14 }}>{meta.label}</span>
-            {isCustom && <span className="badge badge-blue" style={{ fontSize: 11 }}>изменён</span>}
+    <>
+      <div className="card" style={{ overflow: 'hidden', border: isCustom ? '1px solid var(--c-primary-muted)' : '1px solid var(--c-border-solid)' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16, padding: '18px 20px' }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <h3 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>{meta.label}</h3>
+              {isCustom && <span className="badge badge-blue" style={{ fontSize: 11 }}>изменён</span>}
+            </div>
+            <p style={{ fontSize: 13.5, color: 'var(--c-text-3)', margin: 0 }}>{meta.desc}</p>
           </div>
-          <p style={{ margin: '2px 0 0', fontSize: 12, color: 'var(--c-text-3)' }}>{meta.hint}</p>
+          {!open && <button className="btn btn-secondary btn-sm" onClick={() => setOpen(true)}><RotateCcw size={13} /> Редактировать</button>}
         </div>
-        {open ? <ChevronUp size={15} color="var(--c-text-3)" /> : <ChevronDown size={15} color="var(--c-text-3)" />}
+
+        {!open && (
+          <div style={{ padding: '0 20px 18px' }}>
+            <div
+              style={{ fontSize: 13.5, color: 'var(--c-text-2)', lineHeight: 1.65, background: 'var(--c-surface-2)', padding: '12px 14px', borderRadius: 10, fontFamily: 'ui-monospace, SFMono-Regular, monospace', cursor: 'pointer' }}
+              onClick={() => setOpen(true)}>
+              {savedText || defaultText || '(стандартный промпт)'}
+            </div>
+          </div>
+        )}
+
+        {open && (
+          <div style={{ padding: '0 20px 18px', borderTop: '1px solid var(--c-border-solid)' }}>
+            <div style={{ paddingTop: 16 }}>
+              <textarea className="input" value={value} onChange={e => setValue(e.target.value)} rows={6}
+                style={{ resize: 'vertical', lineHeight: 1.6, fontFamily: 'inherit' }} />
+              <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                <button className="btn btn-primary btn-sm" onClick={askSave} disabled={!isDirty || mutation.isPending}>
+                  <CheckCircle size={14} /> Сохранить
+                </button>
+                <button className="btn btn-ghost btn-sm" onClick={() => { setOpen(false); setValue(savedText) }}>Отмена</button>
+                {isCustom && (
+                  <button className="btn btn-ghost btn-sm" onClick={doReset} style={{ marginLeft: 'auto', color: 'var(--c-text-3)' }}>
+                    <RotateCcw size={13} /> Сбросить
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* Editor */}
-      {open && (
-        <div style={{ padding: '14px 16px', borderTop: '1px solid var(--c-border-solid)' }}>
-          <textarea
-            value={value}
-            onChange={e => setValue(e.target.value)}
-            className="input"
-            style={{
-              width: '100%', minHeight: 120, resize: 'vertical',
-              fontFamily: 'monospace', fontSize: 12.5, lineHeight: 1.6,
-            }}
-          />
-          <div style={{ display: 'flex', gap: 8, marginTop: 10, justifyContent: 'flex-end' }}>
-            {isCustom && (
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={handleReset}
-                disabled={mutation.isPending}
-                title="Сбросить до стандартного промпта"
-              >
-                <RotateCcw size={13} />
-                Сбросить
-              </button>
-            )}
-            <button
-              className="btn btn-primary btn-sm"
-              onClick={() => mutation.mutate(value)}
-              disabled={!isDirty || mutation.isPending}
-            >
-              {mutation.isPending
-                ? <><span className="spinner" style={{ width: 12, height: 12, borderWidth: 2 }} />Сохранение...</>
-                : <><CheckCircle size={13} />Сохранить</>
-              }
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
+      <ConfirmModal
+        open={confirmOpen}
+        title="Подтвердите изменение промпта"
+        sub="Новый промпт будет применяться ко всем последующим проверкам. Вы уверены?"
+        onConfirm={doSave}
+        onCancel={() => setConfirmOpen(false)}
+      />
+    </>
   )
 }
 
 export default function Settings() {
+  const [tab, setTab] = useState<'general' | 'prompts'>('general')
+
   const { data: usage, isLoading: usageLoading, refetch: refetchUsage } = useQuery({
     queryKey: ['ai-usage'],
     queryFn: getAiUsage,
     staleTime: 60_000,
   })
-
   const { data: promptsData, isLoading: promptsLoading } = useQuery({
     queryKey: ['ai-prompts'],
     queryFn: getAiPrompts,
     staleTime: 60_000,
   })
+  const { data: me } = useQuery({ queryKey: ['me'], queryFn: getMe })
 
   const prompts: Record<string, string> = promptsData?.prompts ?? {}
   const defaults: Record<string, string> = promptsData?.defaults ?? {}
 
-  const monthIn = usage?.month?.inputTokens ?? 0
-  const monthOut = usage?.month?.outputTokens ?? 0
-  const monthTotal = monthIn + monthOut
-  const monthCalls = usage?.month?.totalCalls ?? 0
-
   const totalIn = usage?.total?.inputTokens ?? 0
   const totalOut = usage?.total?.outputTokens ?? 0
   const totalCalls = usage?.total?.totalCalls ?? 0
+  const monthIn = usage?.month?.inputTokens ?? 0
+  const monthOut = usage?.month?.outputTokens ?? 0
+  const monthCalls = usage?.month?.totalCalls ?? 0
+  const creditUsed = totalIn + totalOut
+  const creditMax = 10_000_000
+  const creditPct = Math.round((creditUsed / creditMax) * 100)
+  const remaining = creditMax - creditUsed
+
+  const teacherName = (me as any)?.teacher?.full_name || (me as any)?.teacher?.email || 'Учитель'
+  const teacherEmail = (me as any)?.teacher?.email || ''
+  const teacherSchool = (me as any)?.teacher?.school || 'AutoCheck'
+  const initials = teacherName.split(' ').map((w: string) => w[0]).slice(0, 2).join('')
 
   return (
-    <div>
+    <div className="content-max fade-in">
       <div className="page-header">
         <div>
           <h1 className="page-title">Настройки</h1>
-          <p className="page-subtitle">Конфигурация AutoCheck</p>
+          <p className="page-subtitle">Управление кредитами и промптами для ИИ</p>
         </div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, alignItems: 'start' }}>
+      <div className="segmented" style={{ marginBottom: 24 }}>
+        <button className={tab === 'general' ? 'active' : ''} onClick={() => setTab('general')}>Использование</button>
+        <button className={tab === 'prompts' ? 'active' : ''} onClick={() => setTab('prompts')}>Промпты ИИ</button>
+      </div>
 
-        {/* ── AI USAGE ─────────────────────────────────────────── */}
-        <div>
-          <div className="card p-6 mb-5">
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                <div style={{
-                  width: 40, height: 40, borderRadius: 10,
-                  background: 'var(--c-primary-light)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                }}>
-                  <Zap size={18} color="var(--c-primary)" />
-                </div>
-                <div>
-                  <h2 style={{ margin: 0, fontSize: 15, fontWeight: 600 }}>Использование API</h2>
-                  <p style={{ margin: '3px 0 0', fontSize: 12, color: 'var(--c-text-3)' }}>Токены Claude AI</p>
-                </div>
+      {tab === 'general' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+          {/* Credits card */}
+          <div className="card card-pad">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
+              <span style={{ width: 44, height: 44, borderRadius: 12, background: 'var(--c-teal-light)', color: 'var(--c-teal)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Zap size={22} />
+              </span>
+              <div style={{ flex: 1 }}>
+                <h3 style={{ fontSize: 18, fontWeight: 700, margin: 0 }}>Токены ИИ</h3>
+                <p style={{ fontSize: 13.5, color: 'var(--c-text-3)', margin: 0 }}>Расход на проверку работ через ИИ</p>
               </div>
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={() => refetchUsage()}
-                title="Обновить"
-              >
-                <RefreshCw size={13} />
+              <button className="btn btn-ghost btn-sm" onClick={() => refetchUsage()} title="Обновить">
+                <RefreshCw size={14} />
               </button>
             </div>
 
             {usageLoading ? (
-              <>
-                <Skeleton height={40} style={{ marginBottom: 12 }} />
-                <Skeleton height={40} style={{ marginBottom: 12 }} />
-                <Skeleton height={40} />
-              </>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <SkelLine w={200} h={40} />
+                <SkelLine h={12} />
+              </div>
             ) : (
               <>
-                {/* This month */}
-                <p style={{ margin: '0 0 10px', fontSize: 12, fontWeight: 700, color: 'var(--c-text-2)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                  Этот месяц
-                </p>
-                <div style={{
-                  display: 'grid', gridTemplateColumns: '1fr 1fr 1fr',
-                  gap: 10, marginBottom: 16,
-                }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 10 }}>
+                  <div>
+                    <span style={{ fontSize: 34, fontWeight: 800, letterSpacing: '-0.02em' }}>{formatNum(creditUsed)}</span>
+                    <span style={{ fontSize: 17, color: 'var(--c-text-3)', fontWeight: 600 }}> / {formatNum(creditMax)}</span>
+                  </div>
+                  <span className="badge badge-teal" style={{ fontSize: 14 }}>{creditPct}% использовано</span>
+                </div>
+                <div className="progress-bar" style={{ height: 12 }}>
+                  <div className="progress-bar-fill teal" style={{ width: `${Math.min(100, creditPct)}%`, transition: 'width 0.6s ease' }} />
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginTop: 18, paddingTop: 18, borderTop: '1px solid var(--c-border-solid)' }}>
                   {[
-                    { label: 'Запросов', value: monthCalls },
-                    { label: 'Вход. токены', value: formatNum(monthIn) },
-                    { label: 'Исход. токены', value: formatNum(monthOut) },
+                    { label: 'Осталось токенов', value: formatNum(remaining) },
+                    { label: 'Запросов всего', value: totalCalls },
+                    { label: 'Входящих всего', value: formatNum(totalIn) },
+                    { label: 'Исходящих всего', value: formatNum(totalOut) },
                   ].map(({ label, value }) => (
-                    <div key={label} style={{
-                      background: 'var(--c-surface-2)', borderRadius: 8,
-                      padding: '10px 12px', textAlign: 'center',
-                      border: '1px solid var(--c-border-solid)',
-                    }}>
-                      <p style={{ margin: '0 0 2px', fontSize: 18, fontWeight: 800, color: 'var(--c-text)' }}>{value}</p>
-                      <p style={{ margin: 0, fontSize: 11, color: 'var(--c-text-3)' }}>{label}</p>
+                    <div key={label}>
+                      <div style={{ fontSize: 13, color: 'var(--c-text-3)' }}>{label}</div>
+                      <div style={{ fontSize: 17, fontWeight: 700, marginTop: 3 }}>{value}</div>
                     </div>
                   ))}
                 </div>
 
-                {/* Progress bars */}
-                <UsageBar
-                  label="Входящие токены (этот месяц)"
-                  value={monthIn}
-                  max={Math.max(monthIn, totalIn / 3)}
-                  color="var(--c-primary)"
-                />
-                <UsageBar
-                  label="Исходящие токены (этот месяц)"
-                  value={monthOut}
-                  max={Math.max(monthOut, totalOut / 3)}
-                  color="var(--c-teal)"
-                />
-
-                <div style={{ height: 1, background: 'var(--c-border-solid)', margin: '16px 0' }} />
-
-                {/* All time */}
-                <p style={{ margin: '0 0 10px', fontSize: 12, fontWeight: 700, color: 'var(--c-text-2)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                  Всего
-                </p>
-                <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-                  {[
-                    { label: 'Запросов', value: totalCalls },
-                    { label: 'Входящих токенов', value: formatNum(totalIn) },
-                    { label: 'Исходящих токенов', value: formatNum(totalOut) },
-                  ].map(({ label, value }) => (
-                    <div key={label} style={{ fontSize: 13 }}>
-                      <span style={{ color: 'var(--c-text-3)' }}>{label}: </span>
-                      <span style={{ fontWeight: 600 }}>{value}</span>
-                    </div>
-                  ))}
+                <div style={{ marginTop: 18, paddingTop: 18, borderTop: '1px solid var(--c-border-solid)' }}>
+                  <p style={{ fontSize: 12, fontWeight: 700, color: 'var(--c-text-3)', textTransform: 'uppercase', letterSpacing: '0.05em', margin: '0 0 12px' }}>Этот месяц</p>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+                    {[
+                      { label: 'Запросов', value: monthCalls },
+                      { label: 'Входящих', value: formatNum(monthIn) },
+                      { label: 'Исходящих', value: formatNum(monthOut) },
+                    ].map(({ label, value }) => (
+                      <div key={label} style={{ background: 'var(--c-surface-2)', border: '1px solid var(--c-border-solid)', borderRadius: 10, padding: '10px 14px', textAlign: 'center' }}>
+                        <div style={{ fontSize: 20, fontWeight: 800 }}>{value}</div>
+                        <div style={{ fontSize: 12, color: 'var(--c-text-3)', marginTop: 2 }}>{label}</div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </>
             )}
           </div>
 
-          {/* System info */}
-          <div className="card p-6">
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 18 }}>
-              <div style={{
-                width: 40, height: 40, borderRadius: 10,
-                background: 'var(--c-teal-light)',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-              }}>
-                <SettingsIcon size={18} color="var(--c-teal)" />
-              </div>
-              <div>
-                <h2 style={{ margin: 0, fontSize: 15, fontWeight: 600 }}>Система</h2>
-                <p style={{ margin: '3px 0 0', fontSize: 12, color: 'var(--c-text-3)' }}>Конфигурация AutoCheck</p>
+          {/* Profile card */}
+          <div className="card card-pad">
+            <h3 style={{ fontSize: 18, fontWeight: 700, margin: '0 0 18px' }}>Профиль</h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+              <div className="avatar" style={{ width: 56, height: 56, fontSize: 22, flexShrink: 0 }}>{initials}</div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 16.5, fontWeight: 700 }}>{teacherName}</div>
+                <div style={{ fontSize: 14, color: 'var(--c-text-3)', marginTop: 2 }}>{teacherEmail} · {teacherSchool}</div>
               </div>
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+
+            <div style={{ marginTop: 18, paddingTop: 18, borderTop: '1px solid var(--c-border-solid)', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
               {[
                 { label: 'Модель проверки', value: 'claude-haiku-4-5' },
                 { label: 'Модель отчётов', value: 'claude-sonnet-4-6' },
                 { label: 'Платформа', value: 'good-teach.itgen.io' },
                 { label: 'База данных', value: 'PostgreSQL 16' },
               ].map(({ label, value }) => (
-                <div key={label} style={{
-                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                  padding: '8px 12px', background: 'var(--c-surface-2)', borderRadius: 8,
-                }}>
+                <div key={label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', background: 'var(--c-surface-2)', borderRadius: 9 }}>
                   <span style={{ fontSize: 13, color: 'var(--c-text-2)' }}>{label}</span>
-                  <code style={{ fontSize: 12, background: '#e2e8f0', padding: '2px 8px', borderRadius: 6 }}>{value}</code>
+                  <code style={{ fontSize: 12, background: 'var(--c-surface-3)', padding: '2px 8px', borderRadius: 6, color: 'var(--c-text)' }}>{value}</code>
                 </div>
               ))}
             </div>
           </div>
         </div>
+      )}
 
-        {/* ── AI PROMPTS ───────────────────────────────────────── */}
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-            <MessageSquare size={16} color="var(--c-text-2)" />
-            <h2 style={{ margin: 0, fontSize: 15, fontWeight: 600 }}>Промпты ИИ</h2>
-            <span className="badge badge-gray" style={{ fontSize: 11 }}>настраиваемые</span>
+      {tab === 'prompts' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {/* Warning */}
+          <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start', padding: '14px 18px', background: 'var(--c-warn-light)', border: '1px solid #fde68a', borderRadius: 14 }}>
+            <AlertTriangle size={19} color="var(--c-warn)" style={{ flexShrink: 0, marginTop: 1 }} />
+            <div>
+              <div style={{ fontSize: 14.5, fontWeight: 700, color: '#92400e' }}>Изменяйте промпты с осторожностью</div>
+              <p style={{ fontSize: 13.5, color: '#b45309', margin: '3px 0 0', lineHeight: 1.5 }}>
+                Промпты напрямую влияют на качество и стиль проверки. Некорректные изменения могут привести к ошибочным оценкам. Каждое сохранение требует подтверждения.
+              </p>
+            </div>
           </div>
-          <p style={{ margin: '0 0 16px', fontSize: 13, color: 'var(--c-text-2)', lineHeight: 1.6 }}>
-            Настройте инструкции для ИИ. Изменения применяются к следующим проверкам.
-            Пустой промпт сбрасывает к стандартному.
-          </p>
 
           {promptsLoading ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {[1, 2, 3].map(i => (
-                <div key={i} className="card" style={{ height: 66 }}>
-                  <div style={{ padding: '14px 16px', display: 'flex', gap: 12 }}>
-                    <Skeleton width={32} height={32} />
-                    <div style={{ flex: 1 }}>
-                      <Skeleton height={14} width="50%" style={{ marginBottom: 6 }} />
-                      <Skeleton height={11} width="80%" />
-                    </div>
-                  </div>
-                </div>
-              ))}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {[1, 2, 3].map(i => <div key={i} className="skeleton" style={{ height: 80, borderRadius: 16 }} />)}
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {Object.keys(PROMPT_META).map(key => (
-                <PromptEditor
-                  key={key}
-                  promptKey={key}
-                  defaultText={defaults[key] ?? ''}
-                  savedText={prompts[key] ?? ''}
-                  meta={PROMPT_META[key]}
-                />
-              ))}
-            </div>
+            Object.keys(PROMPT_META).map(key => (
+              <PromptCard key={key} promptKey={key} defaultText={defaults[key] ?? ''} savedText={prompts[key] ?? ''} />
+            ))
           )}
         </div>
-      </div>
+      )}
     </div>
   )
 }

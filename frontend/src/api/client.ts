@@ -3,6 +3,7 @@ import axios from 'axios'
 const api = axios.create({
   baseURL: '/api',
   withCredentials: true,
+  timeout: 60_000,  // 60 s — matches backend connect-timeout
 })
 
 api.interceptors.response.use(

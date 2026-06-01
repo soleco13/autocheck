@@ -1,6 +1,8 @@
 import SimpleDDP from 'simpleddp';
 import ws from 'ws';
 import { hashPassword } from '../lib/encryption';
+import { genaGuard, teacherKey, sanitizePlatformError } from '../lib/platform-guard';
+import { logger } from '../lib/logger';
 
 const GENA_URL = 'wss://platform.good-teach.itgen.io/websocket';
 
@@ -13,12 +15,21 @@ export function getGenaClient(): any {
     client = new (SimpleDDP as any)({
       endpoint: GENA_URL,
       SocketConstructor: ws,
+      // Exponential backoff: 5s → 10s → 20s → 40s → cap at 60s
       reconnectInterval: 5000,
+      maxReconnectInterval: 60_000,
+      reconnectBackoffMultiplier: 2,
     });
-    client.on('error', (err: Error) => console.error('[Gena DDP] error:', err.message));
+    client.on('error', (err: Error) => {
+      // Only log non-routine connection errors
+      if (!err.message?.includes('ECONNREFUSED') && !err.message?.includes('ETIMEDOUT')) {
+        console.error('[Gena DDP] error:', err.message);
+      }
+    });
     client.on('disconnected', () => {
       console.warn('[Gena DDP] disconnected — clearing auth state');
       currentAuthToken = null;
+      authInProgress = false;
     });
     client.on('connected', () => console.log('[Gena DDP] connected'));
   }
@@ -64,10 +75,10 @@ async function ensureAuthenticated(loginToken: string): Promise<void> {
 
   authInProgress = true;
   try {
-    console.log('[Gena] Resume login...');
+    logger.debug('[Gena] Resume auth...');
     const result = await c.call('login', { resume: loginToken });
     currentAuthToken = result.token || loginToken;
-    console.log('[Gena] Resume login OK, userId:', result.id);
+    logger.debug('[Gena] Resume auth OK');
   } catch (err: any) {
     currentAuthToken = null;
     authInProgress = false;
@@ -77,19 +88,28 @@ async function ensureAuthenticated(loginToken: string): Promise<void> {
 }
 
 export async function callGena(loginToken: string, method: string, ...params: any[]): Promise<any> {
+  // Ensure auth before acquiring the guard slot (auth uses its own retry logic)
   await ensureAuthenticated(loginToken);
   const c = getGenaClient();
 
-  console.log(`[Gena] Calling method: ${method}`, params.length ? JSON.stringify(params) : '');
-  try {
-    const result = await c.call(method, ...params);
-    console.log(`[Gena] ${method} OK, result type:`, typeof result, Array.isArray(result) ? `length=${result.length}` : '');
-    return result;
-  } catch (err: any) {
-    const errMsg = err?.reason || err?.message || String(err);
-    console.error(`[Gena] ${method} FAILED:`, JSON.stringify(err));
-    throw new Error(`DDP method ${method} failed: ${errMsg}`);
-  }
+  // Dedupe key for read-only calls: same method+params from multiple teachers
+  // share one in-flight request.
+  const dedupKey = `gena:${method}:${JSON.stringify(params)}`;
+  const isReadOnly = method.startsWith('api.materials.getAll') || method === 'api.materials.getAllBranchesWithMaterialsBySkills';
+
+  logger.debug({ method: '[Gena DDP call]' }, 'platform call');   // never log real method name at info+
+
+  return genaGuard.call(
+    teacherKey(loginToken),
+    isReadOnly ? dedupKey : null,
+    async () => {
+      try {
+        return await c.call(method, ...params);
+      } catch (err: any) {
+        throw sanitizePlatformError(err);
+      }
+    },
+  );
 }
 
 /**

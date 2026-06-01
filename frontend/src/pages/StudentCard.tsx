@@ -16,7 +16,9 @@ const EDIK_BASE = 'https://editor.good-teach.itgen.io'
 
 export default function StudentCard() {
   const { id } = useParams<{ id: string }>()
-  const { checking, checkStatuses, bulkRunning, bulkProgress, runCheck, startBulkCheck, stopBulkCheck } = useCheckContext()
+  const { checking, checkStatuses, bulkChecks, runCheck, startBulkCheck, stopBulkCheck } = useCheckContext()
+  const bulkProgress = bulkChecks.get(id!)
+  const myBulkRunning = !!bulkProgress
 
   const [showNewCheck, setShowNewCheck] = useState(false)
   const [newEditorUrl, setNewEditorUrl] = useState('')
@@ -61,7 +63,6 @@ export default function StudentCard() {
   const uncheckedWithToken = works.filter(w => !w.check_status && w.trainer_token)
 
   // Is bulk running for THIS student?
-  const myBulkRunning = bulkRunning && bulkProgress?.studentId === id
 
   const handleNewCheck = (e: FormEvent) => {
     e.preventDefault()
@@ -216,7 +217,7 @@ export default function StudentCard() {
                 <button
                   key={n}
                   onClick={() => startBulkCheck(id!, works, n, () => refetch())}
-                  disabled={bulkRunning}
+                  disabled={myBulkRunning}
                   className="btn btn-secondary btn-sm"
                   title={`Проверить первые ${n} непроверенных работ`}
                 >
@@ -226,7 +227,7 @@ export default function StudentCard() {
               ))}
               <button
                 onClick={() => startBulkCheck(id!, works, 'all', () => refetch())}
-                disabled={bulkRunning}
+                disabled={myBulkRunning}
                 className="btn btn-secondary btn-sm"
                 title={`Проверить все ${uncheckedWithToken.length} непроверенных работ`}
               >
@@ -239,12 +240,12 @@ export default function StudentCard() {
           {/* Stop bulk button — shown when bulk is running for this student */}
           {myBulkRunning && (
             <button
-              onClick={stopBulkCheck}
+              onClick={() => stopBulkCheck(id!)}
               className="btn btn-sm"
               style={{ background: 'var(--c-danger)', color: '#fff', border: 'none', gap: 5 }}
             >
               <Square size={12} />
-              Остановить ({bulkProgress!.done}/{bulkProgress!.total})
+              Остановить ({bulkProgress?.done ?? 0}/{bulkProgress?.total ?? 0})
             </button>
           )}
 

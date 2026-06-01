@@ -1,38 +1,25 @@
 import { createContext, useContext, useState, useRef, useCallback, ReactNode } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { startCheck, getCheckJob, bulkCheck } from '../api/client'
+import { startCheck, bulkCheck, getStudentWorks } from '../api/client'
 import { toast } from '../components/Toast'
 
-interface BulkProgress {
+export interface BulkProgress {
   done: number
   total: number
   studentId: string
 }
 
 interface CheckContextValue {
-  // Per-item individual checks
-  checking: Set<string>          // set of materialIds being checked right now
+  checking: Set<string>
   checkStatuses: Record<string, string>
 
-  // Bulk check
-  bulkRunning: boolean
-  bulkProgress: BulkProgress | null
+  // Map of studentId → progress for ALL currently running bulk checks
+  bulkChecks: Map<string, BulkProgress>
 
-  runCheck: (
-    studentId: string,
-    materialId: string,
-    trainerToken?: string,
-    onDone?: () => void,
-  ) => void
-
-  startBulkCheck: (
-    studentId: string,
-    works: any[],
-    count: number | 'all',
-    onDone?: () => void,
-  ) => void
-
-  stopBulkCheck: () => void
+  runCheck: (studentId: string, materialId: string, trainerToken?: string, onDone?: () => void) => void
+  startBulkCheck: (studentId: string, works: any[], count: number | 'all', onDone?: () => void) => void
+  stopBulkCheck: (studentId: string) => void
+  stopAllBulkChecks: () => void
 }
 
 const CheckContext = createContext<CheckContextValue | null>(null)
@@ -43,11 +30,12 @@ export function CheckProvider({ children }: { children: ReactNode }) {
   const qc = useQueryClient()
   const [checking, setChecking] = useState<Set<string>>(new Set())
   const [checkStatuses, setCheckStatuses] = useState<Record<string, string>>({})
-  const [bulkRunning, setBulkRunning] = useState(false)
-  const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null)
-  const stopFlag = useRef(false)
+  const [bulkChecks, setBulkChecks] = useState<Map<string, BulkProgress>>(new Map())
 
-  // ── Single item check (non-blocking for other rows) ──────────────────────
+  // Per-student stop flags — add studentId to stop that student's check
+  const stopFlags = useRef<Set<string>>(new Set())
+
+  // ── Single item check ──────────────────────────────────────────────────────
   const runCheck = useCallback(async (
     studentId: string,
     materialId: string,
@@ -59,7 +47,6 @@ export function CheckProvider({ children }: { children: ReactNode }) {
     setCheckStatuses(prev => ({ ...prev, [materialId]: 'queued' }))
 
     try {
-      // Enqueue
       const job = await startCheck(studentId, materialId, trainerToken, trainerToken ? materialId : undefined)
       if (job.status === 'completed') {
         onDone?.()
@@ -71,10 +58,10 @@ export function CheckProvider({ children }: { children: ReactNode }) {
       if (job.status === 'failed') throw new Error(job.error || 'Ошибка проверки')
       if (!job.jobId) throw new Error('Не удалось поставить в очередь')
 
-      // Poll
       const deadline = Date.now() + 5 * 60_000
       while (Date.now() < deadline) {
         await sleep(1500)
+        const { getCheckJob } = await import('../api/client')
         const cur = await getCheckJob(job.jobId)
         setCheckStatuses(prev => ({ ...prev, [materialId]: cur.status }))
         if (cur.status === 'completed') {
@@ -95,14 +82,13 @@ export function CheckProvider({ children }: { children: ReactNode }) {
     }
   }, [checking, qc])
 
-  // ── Bulk check ────────────────────────────────────────────────────────────
+  // ── Bulk check (supports multiple students simultaneously) ─────────────────
   const startBulkCheck = useCallback(async (
     studentId: string,
     works: any[],
     count: number | 'all',
     onDone?: () => void,
   ) => {
-    // Filter: only unchecked works with trainerToken
     const unchecked = works.filter(w => !w.check_status && w.trainer_token)
     const toCheck = count === 'all' ? unchecked : unchecked.slice(0, count)
 
@@ -111,87 +97,95 @@ export function CheckProvider({ children }: { children: ReactNode }) {
       return
     }
 
-    stopFlag.current = false
-    setBulkRunning(true)
-    setBulkProgress({ done: 0, total: toCheck.length, studentId })
+    // Allow restarting a stopped check for the same student
+    stopFlags.current.delete(studentId)
+
+    const total = toCheck.length
+    const targetIds = new Set(toCheck.map((w: any) => w.platform_material_id as string))
+
+    setBulkChecks(prev => new Map(prev).set(studentId, { done: 0, total, studentId }))
 
     try {
-      const items = toCheck.map((w: any) => ({
+      await bulkCheck(toCheck.map((w: any) => ({
         studentId,
         materialId: w.platform_material_id,
         trainerToken: w.trainer_token,
-      }))
+      })))
 
-      const { jobIds } = await bulkCheck(items)
-      if (jobIds.length === 0) {
-        toast.success('Все работы уже проверены или поставлены в очередь')
-        return
-      }
-
-      const total = jobIds.length
-      const pending = new Set(jobIds)
       const deadline = Date.now() + 15 * 60_000
+      let done = 0
+      let lastDone = -1
 
-      while (pending.size > 0 && Date.now() < deadline) {
-        if (stopFlag.current) {
-          toast.success(`Остановлено. Проверено: ${total - pending.size} из ${total}`)
-          return
-        }
+      while (done < total && Date.now() < deadline && !stopFlags.current.has(studentId)) {
+        await sleep(2500)
+        if (stopFlags.current.has(studentId)) break
 
-        await sleep(2000)
-        if (stopFlag.current) {
-          toast.success(`Остановлено. Проверено: ${total - pending.size} из ${total}`)
-          return
-        }
+        try {
+          const result = await getStudentWorks(studentId)
+          const currentWorks: any[] = result.works ?? []
 
-        // Check each pending job
-        for (const jobId of [...pending]) {
-          if (stopFlag.current) break
-          try {
-            const job = await getCheckJob(jobId)
-            if (job.status === 'completed' || job.status === 'failed') {
-              pending.delete(jobId)
-            }
-          } catch { /* skip */ }
-        }
+          done = currentWorks.filter((cw: any) =>
+            targetIds.has(cw.platform_material_id) && !!cw.check_status
+          ).length
 
-        const done = total - pending.size
-        setBulkProgress({ done, total, studentId })
+          setBulkChecks(prev => {
+            const next = new Map(prev)
+            // Only update if this check is still tracked (not stopped)
+            if (next.has(studentId)) next.set(studentId, { done, total, studentId })
+            return next
+          })
 
-        // Refresh every 5 completed jobs or when all done
-        if (done > 0 && (done % 5 === 0 || pending.size === 0)) {
-          qc.invalidateQueries({ queryKey: ['student-works', studentId] })
-          qc.invalidateQueries({ queryKey: ['student', studentId] })
+          if (done !== lastDone) {
+            qc.invalidateQueries({ queryKey: ['student-works', studentId] })
+            qc.invalidateQueries({ queryKey: ['student', studentId] })
+            lastDone = done
+          }
+        } catch {
+          // Network hiccup — keep polling
         }
       }
 
-      if (!stopFlag.current) {
+      const wasStopped = stopFlags.current.has(studentId)
+      if (!wasStopped) {
         qc.invalidateQueries({ queryKey: ['student-works', studentId] })
         qc.invalidateQueries({ queryKey: ['student', studentId] })
         onDone?.()
-        toast.success(`Проверено: ${total - pending.size} из ${total}`)
+        toast.success(`${studentId}: проверено ${done} из ${total}`)
       }
     } catch (err: any) {
       toast.error(err.response?.data?.error || err.message || 'Ошибка массовой проверки')
     } finally {
-      if (!stopFlag.current) {
-        setBulkRunning(false)
-        setBulkProgress(null)
-      }
+      stopFlags.current.delete(studentId)
+      setBulkChecks(prev => {
+        const next = new Map(prev)
+        next.delete(studentId)
+        return next
+      })
     }
   }, [qc])
 
-  const stopBulkCheck = useCallback(() => {
-    stopFlag.current = true
-    setBulkRunning(false)
-    setBulkProgress(null)
+  const stopBulkCheck = useCallback((studentId: string) => {
+    stopFlags.current.add(studentId)
+    setBulkChecks(prev => {
+      const next = new Map(prev)
+      next.delete(studentId)
+      return next
+    })
+    toast.success('Проверка остановлена')
+  }, [])
+
+  const stopAllBulkChecks = useCallback(() => {
+    setBulkChecks(prev => {
+      prev.forEach((_, id) => stopFlags.current.add(id))
+      return new Map()
+    })
   }, [])
 
   return (
     <CheckContext.Provider value={{
       checking, checkStatuses,
-      bulkRunning, bulkProgress,
-      runCheck, startBulkCheck, stopBulkCheck,
+      bulkChecks,
+      runCheck, startBulkCheck, stopBulkCheck, stopAllBulkChecks,
     }}>
       {children}
     </CheckContext.Provider>

@@ -66,7 +66,7 @@ export function getCheckQueue(): Queue<CheckJobData> {
       defaultJobOptions: {
         attempts: 2,
         backoff: { type: 'exponential', delay: 3000 },
-        removeOnComplete: 100,   // keep last 100 for inspection
+        removeOnComplete: 100,
         removeOnFail: 500,
       },
     };

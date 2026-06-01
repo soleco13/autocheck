@@ -172,19 +172,22 @@ export async function enqueueCheckJob(
   p: EnqueueParams,
 ): Promise<{ jobId: string | null; skipped: boolean; status: 'queued' | 'completed' | 'failed' }> {
   if (p.dedupe && p.platformMaterialId) {
+    // Both queries now include teacher_id to prevent cross-teacher dedup collisions
     const reported = await db.query(
       `SELECT 1 FROM reports r
        JOIN student_sessions ss ON ss.id = r.session_id
        JOIN control_sheets cs ON cs.id = ss.control_sheet_id
-       WHERE ss.student_id = $1 AND cs.platform_material_id = $2 LIMIT 1`,
-      [p.studentId, p.platformMaterialId],
+       WHERE ss.student_id = $1 AND cs.platform_material_id = $2
+         AND ss.teacher_id = $3 LIMIT 1`,
+      [p.studentId, p.platformMaterialId, p.teacherId],
     );
     if (reported.rows[0]) return { jobId: null, skipped: true, status: 'completed' };
 
     const active = await db.query(
-      `SELECT 1 FROM check_jobs WHERE student_id = $1 AND platform_material_id = $2
-       AND status IN ('queued','processing') LIMIT 1`,
-      [p.studentId, p.platformMaterialId],
+      `SELECT 1 FROM check_jobs
+       WHERE student_id = $1 AND platform_material_id = $2
+         AND teacher_id = $3 AND status IN ('queued','processing') LIMIT 1`,
+      [p.studentId, p.platformMaterialId, p.teacherId],
     );
     if (active.rows[0]) return { jobId: null, skipped: true, status: 'queued' };
   }

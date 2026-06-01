@@ -1,6 +1,8 @@
 import SimpleDDP from 'simpleddp';
 import ws from 'ws';
 import { hashPassword } from '../lib/encryption';
+import { edikGuard, teacherKey, sanitizePlatformError } from '../lib/platform-guard';
+import { logger } from '../lib/logger';
 
 const EDIK_URL = 'wss://editor.good-teach.itgen.io/websocket';
 
@@ -14,16 +16,22 @@ export function getEdikClient(): any {
       endpoint: EDIK_URL,
       SocketConstructor: ws,
       reconnectInterval: 5000,
+      maxReconnectInterval: 60_000,
+      reconnectBackoffMultiplier: 2,
     });
 
     client.on('error', (err: Error) => {
-      console.error('[Edik DDP] error:', err.message);
+      if (!err.message?.includes('ECONNREFUSED') && !err.message?.includes('ETIMEDOUT')) {
+        console.error('[Edik DDP] error:', err.message);
+      }
     });
 
     client.on('disconnected', () => {
-      console.warn('[Edik DDP] disconnected');
+      logger.warn('[Edik DDP] disconnected');
       currentEdikToken = null;
+      edikAuthInProgress = false;
     });
+    client.on('connected', () => logger.info('[Edik DDP] connected'));
   }
   return client;
 }
@@ -67,10 +75,10 @@ export async function ensureEdikAuthenticated(edikResumeToken: string): Promise<
 
   edikAuthInProgress = true;
   try {
-    console.log('[Edik] Resume login...');
+    logger.debug('[Edik] Resume auth...');
     const result = await c.call('login', { resume: edikResumeToken });
     currentEdikToken = result.token || edikResumeToken;
-    console.log('[Edik] Resume login OK, userId:', result.id);
+    logger.debug('[Edik] Resume auth OK');
   } catch (err: any) {
     currentEdikToken = null;
     edikAuthInProgress = false;
@@ -80,23 +88,32 @@ export async function ensureEdikAuthenticated(edikResumeToken: string): Promise<
 }
 
 // getMaterialSessionState works WITHOUT user auth — JWT provides authorization.
-// getMaterialBySession requires auth (returns NOT_AUTHORIZED for anonymous users).
 export async function getMaterialSessionState(token: string): Promise<any> {
   const c = getEdikClient();
   if (!c.connected) await connectEdik();
-  return c.call('api.materials-sessions.getMaterialSessionState', { token });
+  // Dedupe: same session state requested by multiple concurrent checks → one call
+  return edikGuard.call(
+    'anon',  // no teacher context — keyed globally
+    `edik:sessionState:${token}`,
+    () => c.call('api.materials-sessions.getMaterialSessionState', { token }),
+  );
 }
 
 // Optional: get material title. Requires Edik user auth. Falls back to null on NOT_AUTHORIZED.
 export async function getMaterialBySession(accessToken: string, loginToken?: string): Promise<any> {
   const c = getEdikClient();
   if (!c.connected) await connectEdik();
+  const tk = loginToken ? teacherKey(loginToken) : 'anon';
   try {
     if (loginToken) await ensureEdikAuthenticated(loginToken);
-    return await c.call('api.materials-sessions.getMaterialBySession', { accessToken });
+    return await edikGuard.call(
+      tk,
+      `edik:bySession:${accessToken}`,
+      () => c.call('api.materials-sessions.getMaterialBySession', { accessToken }),
+    );
   } catch (err: any) {
-    if (err.message?.includes('NOT_AUTHORIZED') || err.message?.includes('not-authorized')) {
-      return null; // Title unavailable without Edik auth — not critical
+    if (err.message?.includes('NOT_AUTHORIZED') || err.message?.includes('not-authorized') || err.message?.includes('доступа')) {
+      return null;
     }
     throw err;
   }
@@ -105,7 +122,11 @@ export async function getMaterialBySession(accessToken: string, loginToken?: str
 export async function getMaterial(materialId: string): Promise<any> {
   const c = getEdikClient();
   if (!c.connected) await connectEdik();
-  return c.call('api.materials.getMaterial', { materialId });
+  return edikGuard.call(
+    'anon',
+    `edik:material:${materialId}`,
+    () => c.call('api.materials.getMaterial', { materialId }),
+  );
 }
 
 export async function getChildMaterialsEdik(childId: string, lessonId?: string): Promise<any[]> {
@@ -113,7 +134,11 @@ export async function getChildMaterialsEdik(childId: string, lessonId?: string):
   if (!c.connected) await connectEdik();
   const params: any = { childId };
   if (lessonId) params.lessonId = lessonId;
-  return c.call('api.materials.getChildsMaterials', params);
+  return edikGuard.call(
+    'anon',
+    null,
+    () => c.call('api.materials.getChildsMaterials', params),
+  );
 }
 
 /**
@@ -122,11 +147,14 @@ export async function getChildMaterialsEdik(childId: string, lessonId?: string):
  */
 export async function getMaterialSessionJwtFromEdik(
   materialId: string,
-  studentId: string
+  studentId: string,
+  loginToken?: string,
 ): Promise<string | null> {
   const c = getEdikClient();
   if (!c.connected) await connectEdik();
+  const tk = loginToken ? teacherKey(loginToken) : 'anon';
 
+  // Try methods in order — stop at first success
   const attempts: Array<[string, object]> = [
     ['api.materials-sessions.createSession',   { materialId, studentId }],
     ['api.materials-sessions.createSession',   { materialId, childId: studentId }],
@@ -137,17 +165,22 @@ export async function getMaterialSessionJwtFromEdik(
 
   for (const [method, params] of attempts) {
     try {
-      const result = await c.call(method, params);
+      const result = await edikGuard.call(
+        tk,
+        null,  // no dedup — each attempt is distinct
+        () => c.call(method, params),
+      );
       if (!result) continue;
-      const jwt = result.accessToken || result.token || result.jwt || result.sessionToken ||
+      const r = result as any;
+      const jwt = r.accessToken || r.token || r.jwt || r.sessionToken ||
                   (typeof result === 'string' ? result : null);
       if (jwt && typeof jwt === 'string' && jwt.split('.').length === 3) {
-        console.log(`[Edik] getMaterialSessionJwtFromEdik OK via ${method}`);
         return jwt;
       }
     } catch (err: any) {
-      if (!err.message?.includes('[404]')) {
-        console.warn(`[Edik] ${method} failed:`, err.message?.slice(0, 80));
+      // 404 → method doesn't exist on this platform — try next silently
+      if (!err.message?.includes('[404]') && !err.message?.includes('не найден')) {
+        logger.debug({ msg: err.message?.slice(0, 60) }, '[Edik] session JWT attempt failed');
       }
     }
   }

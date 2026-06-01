@@ -1,5 +1,6 @@
 import { Router, Response } from 'express';
 import { requireAuth, AuthRequest } from '../middleware/auth-middleware';
+import { safeError } from '../lib/safe-error';
 import { getDecryptedToken } from '../services/auth';
 import { callGena, getChildsMaterials, getNewMaterialsMap } from '../ddp/gena-client';
 import { db } from '../db';
@@ -106,7 +107,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
     });
   } catch (err: any) {
     console.error('[materials] GET / error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -240,7 +241,7 @@ router.get('/:materialId/students', requireAuth, async (req: AuthRequest, res: R
     });
   } catch (err: any) {
     console.error('[materials/:id/students] error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 

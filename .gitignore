@@ -13,6 +13,14 @@ backend/dist/
 
 # Logs
 *.log
+logs/
+.pm2/
+
+# Claude Code AI memory (local only)
+.claude/
+
+# Stray image artifacts at root
+pers_talk.png
 backend/server.log
 backend-dev.log
 backend-dev-err.log

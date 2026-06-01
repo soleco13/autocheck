@@ -11,6 +11,7 @@ import Materials from './pages/Materials'
 import MaterialDetail from './pages/MaterialDetail'
 import History from './pages/History'
 import Settings from './pages/Settings'
+import Help from './pages/Help'
 import Layout from './components/Layout'
 import { ToastProvider } from './components/Toast'
 import { Skeleton } from './components/Skeleton'
@@ -70,6 +71,7 @@ export default function App() {
           <Route path="materials/:materialId" element={<MaterialDetail />} />
           <Route path="history" element={<History />} />
           <Route path="settings" element={<Settings />} />
+          <Route path="help" element={<Help />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
