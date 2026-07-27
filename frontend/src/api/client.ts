@@ -9,7 +9,7 @@ const api = axios.create({
 api.interceptors.response.use(
   r => r,
   err => {
-    if (err.response?.status === 401) {
+    if (err.response?.status === 401 && window.location.pathname !== '/login') {
       window.location.href = '/login'
     }
     return Promise.reject(err)
@@ -28,9 +28,28 @@ export const logout = () =>
 export const getMe = () =>
   api.get('/auth/me').then(r => r.data)
 
-// Students
-export const getStudents = (sync = false) =>
-  api.get(`/students${sync ? '?sync=true' : ''}`).then(r => r.data)
+/** Refresh session JWT (call every ~6 days or on 401 to extend the session). */
+export const refreshSession = () =>
+  api.post('/auth/refresh').then(r => r.data)
+
+/** Refresh the Gena platform token (call when works page shows platformError). */
+export const refreshPlatformToken = () =>
+  api.post('/auth/refresh-platform').then(r => r.data)
+
+// Students — returns { students: [], pagination: {...} }
+export const getStudentsPaginated = (opts?: { sync?: boolean; search?: string; page?: number; pageSize?: number }) => {
+  const params = new URLSearchParams()
+  if (opts?.sync) params.set('sync', 'true')
+  if (opts?.search) params.set('search', opts.search)
+  if (opts?.page) params.set('page', String(opts.page))
+  if (opts?.pageSize) params.set('pageSize', String(opts.pageSize))
+  const qs = params.toString()
+  return api.get(`/students${qs ? '?' + qs : ''}`).then(r => r.data as { students: any[]; pagination: { page: number; pageSize: number; total: number; totalPages: number } })
+}
+
+// Backward-compat: returns flat array (uses large pageSize to get all students)
+export const getStudents = (opts?: { sync?: boolean }) =>
+  getStudentsPaginated({ ...opts, pageSize: 500 }).then(d => d.students)
 
 export const syncClassrooms = () =>
   api.post('/students/sync-classrooms').then(r => r.data)
@@ -70,6 +89,12 @@ export const startCheck = (studentId: string, editorUrl: string, trainerToken?: 
 export const getCheckJob = (jobId: string): Promise<CheckJob> =>
   api.get(`/checks/jobs/${jobId}`).then(r => r.data)
 
+export const getActiveJobs = (): Promise<Array<{ studentId: string; jobIds: string[]; total: number }>> =>
+  api.get('/checks/jobs/active').then(r => r.data)
+
+export const cancelStudentJobs = (studentId: string): Promise<{ ok: boolean }> =>
+  api.post('/checks/jobs/cancel', { studentId }).then(r => r.data)
+
 // Enqueues a check and resolves only once it has finished (or failed). Handles both
 // modes: if the POST already returned a terminal status (inline), returns immediately;
 // otherwise polls the job until done. `onStatus` reports intermediate states for the UI.
@@ -102,25 +127,63 @@ export interface BulkCheckItem { studentId: string; materialId: string; trainerT
 export const bulkCheck = (items: BulkCheckItem[]): Promise<{ enqueued: number; skipped: number; jobIds: string[] }> =>
   api.post('/checks/bulk', { items }).then(r => r.data)
 
-// Polls a set of job ids until all reach a terminal state. `onProgress(done, total)`
-// reports completion count for a progress indicator.
+// Batch job status — single request for up to 1000 job IDs.
+// Returns [{ id, status, error }] for whichever IDs the teacher owns.
+export const getBulkJobStatus = (
+  ids: string[],
+): Promise<Array<{ id: string; status: string; error?: string | null }>> =>
+  api.post('/checks/jobs/status', { ids }).then(r => r.data)
+
+// Polls a set of job IDs until all reach a terminal state (completed / failed).
+// Uses batch status endpoint (one HTTP request per poll tick regardless of job count).
+// Returns { completed, failed } counts once all jobs reach a terminal state or deadline.
+// `onProgress(done, total)` fires after each tick with combined terminal count.
+// `isCancelled()` — if provided and returns true, exits the loop early.
+// Timeout scales with batch size (includes BullMQ retry window: 2 s/job + 65 s retry buffer).
 export async function waitForJobs(
   jobIds: string[],
   onProgress?: (done: number, total: number) => void,
-): Promise<void> {
-  if (jobIds.length === 0) return
+  isCancelled?: () => boolean,
+): Promise<{ completed: number; failed: number }> {
+  if (jobIds.length === 0) return { completed: 0, failed: 0 }
   const pending = new Set(jobIds)
-  const deadline = Date.now() + 15 * 60 * 1000
+  const total = jobIds.length
+  let completedCount = 0
+  let failedCount = 0
+  // Dynamic deadline: at least 20 min (to allow one 65s BullMQ retry + processing time),
+  // 5 s per job estimate, max 4 h.
+  const deadline = Date.now() + Math.min(4 * 60 * 60_000, Math.max(20 * 60_000, total * 5_000))
+  let noProgressTicks = 0
+
   while (pending.size > 0 && Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 2000))
-    for (const id of [...pending]) {
+    if (isCancelled?.()) break
+
+    // Adaptive interval: back off when no progress to reduce server load
+    const intervalMs = noProgressTicks >= 4 ? 6_000 : 3_000
+    await new Promise(r => setTimeout(r, intervalMs))
+    if (isCancelled?.()) break
+
+    const prevSize = pending.size
+
+    // Poll in chunks of 200 to stay within URL-safe limits
+    const ids = [...pending]
+    for (let i = 0; i < ids.length; i += 200) {
       try {
-        const job = await getCheckJob(id)
-        if (job.status === 'completed' || job.status === 'failed') pending.delete(id)
-      } catch { /* keep polling */ }
+        const statuses = await getBulkJobStatus(ids.slice(i, i + 200))
+        for (const job of statuses) {
+          if (job.status === 'completed') { completedCount++; pending.delete(job.id) }
+          else if (job.status === 'failed') { failedCount++; pending.delete(job.id) }
+        }
+      } catch { /* network hiccup — keep polling */ }
     }
-    onProgress?.(jobIds.length - pending.size, jobIds.length)
+
+    if (pending.size === prevSize) noProgressTicks++
+    else noProgressTicks = 0
+
+    onProgress?.(total - pending.size, total)
   }
+
+  return { completed: completedCount, failed: failedCount }
 }
 
 export const getCheckReport = (sessionId: string) =>
@@ -133,15 +196,37 @@ export const getReport = (id: string) =>
 export const overrideAnswerScore = (answerId: string, score: number, note?: string) =>
   api.patch(`/reports/answers/${answerId}/override`, { score, note }).then(r => r.data)
 
-// Textbooks
+// Textbooks (RAG)
 export const getTextbooks = () =>
   api.get('/textbooks').then(r => r.data)
 
-export const createTextbook = (data: any) =>
-  api.post('/textbooks', data).then(r => r.data)
+export const uploadTextbookPdf = (formData: FormData) =>
+  api.post('/textbooks/upload-pdf', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 120_000,
+  }).then(r => r.data as { id: string; status: string })
 
-export const uploadTextbookContent = (id: string, sections: any[]) =>
-  api.post(`/textbooks/${id}/content`, { sections }).then(r => r.data)
+export const getTextbookStatus = (id: string) =>
+  api.get(`/textbooks/${id}/status`).then(r => r.data as {
+    id: string
+    status: 'pending' | 'processing' | 'ready' | 'error'
+    progress_step: string | null
+    progress_pct: number
+    chunk_count: number
+    error_msg: string | null
+  })
+
+export const deleteTextbook = (id: string) =>
+  api.delete(`/textbooks/${id}`).then(r => r.data)
+
+export const reindexTextbook = (id: string, file: File) => {
+  const fd = new FormData()
+  fd.append('file', file)
+  return api.post(`/textbooks/${id}/reindex`, fd, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 120_000,
+  }).then(r => r.data as { id: string; status: string })
+}
 
 // Materials
 export const getMaterials = (params: {
@@ -171,6 +256,13 @@ export const getAiPrompts = () =>
 
 export const saveAiPrompt = (key: string, text: string) =>
   api.post('/settings/ai-prompts', { key, text }).then(r => r.data)
+
+// Platform monitoring (Monti APM)
+export const getPlatformStatus = () =>
+  api.get('/platform/status').then(r => r.data)
+
+export const getPlatformReport = () =>
+  api.post('/platform/report').then(r => r.data)
 
 // Instant DB-only fetch (returns only already-checked students)
 export const getMaterialStudentsDb = (materialId: string) =>

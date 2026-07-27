@@ -1,21 +1,31 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Zap, MessageSquare, CheckCircle, RotateCcw, AlertTriangle, ChevronDown, ChevronUp, RefreshCw } from 'lucide-react'
+import { useSearchParams } from 'react-router-dom'
+import { Zap, CheckCircle, RotateCcw, AlertTriangle, RefreshCw, Brain, BookOpen } from 'lucide-react'
 import { getAiUsage, getAiPrompts, saveAiPrompt, getMe } from '../api/client'
+import api from '../api/client'
+import PlatformTab from './PlatformTab'
+
+const getSystemParams = () => api.get('/settings/system').then(r => r.data)
+const setSystemParam  = (key: string, value: number) => api.post('/settings/system', { key, value }).then(r => r.data)
+const resetSystemParam = (key: string) => api.post('/settings/system/reset', { key }).then(r => r.data)
 import { toast } from '../components/Toast'
 
-const PROMPT_META: Record<string, { label: string; desc: string }> = {
+const PROMPT_META: Record<string, { label: string; desc: string; model: string }> = {
   checker_system: {
     label: 'Системный промпт проверки',
-    desc: 'Основные инструкции для ИИ при проверке работ (модель claude-haiku)',
+    desc: 'Инструкции для ИИ при проверке каждого ответа ученика. Влияет на строгость, тон и критерии оценки.',
+    model: 'claude-sonnet-4-6',
   },
   report_student: {
     label: 'Промпт комментария ученику',
-    desc: 'Как ИИ формулирует обратную связь для ученика',
+    desc: 'Как ИИ формулирует обратную связь для ученика в итоговом отчёте.',
+    model: 'claude-sonnet-4-6',
   },
   report_teacher: {
     label: 'Промпт рекомендаций учителю',
-    desc: 'Сводка и рекомендации для преподавателя',
+    desc: 'Профессиональная сводка и рекомендации для преподавателя в итоговом отчёте.',
+    model: 'claude-sonnet-4-6',
   },
 }
 
@@ -80,9 +90,10 @@ function PromptCard({ promptKey, defaultText, savedText }: { promptKey: string; 
       <div className="card" style={{ overflow: 'hidden', border: isCustom ? '1px solid var(--c-primary-muted)' : '1px solid var(--c-border-solid)' }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16, padding: '18px 20px' }}>
           <div style={{ flex: 1 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, flexWrap: 'wrap' }}>
               <h3 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>{meta.label}</h3>
               {isCustom && <span className="badge badge-blue" style={{ fontSize: 11 }}>изменён</span>}
+              <code style={{ fontSize: 11, background: 'var(--c-surface-2)', border: '1px solid var(--c-border-solid)', padding: '1px 7px', borderRadius: 6, color: 'var(--c-text-3)' }}>{meta.model}</code>
             </div>
             <p style={{ fontSize: 13.5, color: 'var(--c-text-3)', margin: 0 }}>{meta.desc}</p>
           </div>
@@ -131,8 +142,243 @@ function PromptCard({ promptKey, defaultText, savedText }: { promptKey: string; 
   )
 }
 
+// ── System params UI ─────────────────────────────────────────────────────────
+const CATEGORY_LABELS: Record<string, string> = {
+  rag:           'Источник знаний',
+  ai:            'ИИ-проверка',
+  platform_gena: 'Платформа Gena',
+  platform_edik: 'Платформа Edik',
+  checks:        'Проверки и лимиты',
+  cache:         'Кеш',
+}
+
+// Тумблер для булевых параметров (min=0, max=1)
+function RagModeToggle({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  const isRag = value === 1
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 0, background: 'var(--c-surface-2)', border: '1px solid var(--c-border-solid)', borderRadius: 12, padding: 4 }}>
+      <button
+        onClick={() => onChange(0)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 6, padding: '7px 16px', borderRadius: 9,
+          fontSize: 13.5, fontWeight: 650, cursor: 'pointer', border: 'none',
+          background: !isRag ? 'var(--c-primary)' : 'transparent',
+          color: !isRag ? '#fff' : 'var(--c-text-3)',
+          transition: 'all 0.18s',
+        }}
+      >
+        <Brain size={15} />
+        ИИ
+      </button>
+      <button
+        onClick={() => onChange(1)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 6, padding: '7px 16px', borderRadius: 9,
+          fontSize: 13.5, fontWeight: 650, cursor: 'pointer', border: 'none',
+          background: isRag ? '#16a34a' : 'transparent',
+          color: isRag ? '#fff' : 'var(--c-text-3)',
+          transition: 'all 0.18s',
+        }}
+      >
+        <BookOpen size={15} />
+        Учебники
+      </button>
+    </div>
+  )
+}
+
+function SystemTab() {
+  const qc = useQueryClient()
+  const [drafts, setDrafts] = useState<Record<string, number>>({})
+  const [saving, setSaving] = useState(false)
+  const [resetting, setResetting] = useState(false)
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['system-params'],
+    queryFn: getSystemParams,
+    staleTime: 30_000,
+  })
+
+  const params: Record<string, any> = data?.params ?? {}
+
+  useEffect(() => { setDrafts({}) }, [data])
+
+  const getDraft = (key: string): number => drafts[key] ?? params[key]?.value ?? 0
+  const isDirtyKey = (key: string) => drafts[key] !== undefined && drafts[key] !== params[key]?.value
+  const dirtyKeys = Object.keys(params).filter(isDirtyKey)
+  const anyDirty = dirtyKeys.length > 0
+  const anyCustom = Object.values(params).some((p: any) => p.isCustom)
+
+  const setDraft = (key: string, v: number) => setDrafts(d => ({ ...d, [key]: v }))
+
+  const handleSaveAll = async () => {
+    setSaving(true)
+    try {
+      await Promise.all(dirtyKeys.map(k => setSystemParam(k, getDraft(k))))
+      qc.invalidateQueries({ queryKey: ['system-params'] })
+      setDrafts({})
+      toast.success(`Сохранено ${dirtyKeys.length} параметр${dirtyKeys.length === 1 ? '' : 'а/ов'}`)
+    } catch { toast.error('Ошибка сохранения') }
+    finally { setSaving(false) }
+  }
+
+  const handleResetAll = async () => {
+    setResetting(true)
+    try {
+      const customKeys = Object.entries(params).filter(([, v]: any) => v.isCustom).map(([k]) => k)
+      await Promise.all(customKeys.map(k => resetSystemParam(k)))
+      qc.invalidateQueries({ queryKey: ['system-params'] })
+      setDrafts({})
+      toast.success('Все параметры сброшены к значениям по умолчанию')
+    } catch { toast.error('Ошибка сброса') }
+    finally { setResetting(false) }
+  }
+
+  if (isLoading) return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      {[1,2,3,4,5,6].map(i => <div key={i} className="skeleton" style={{ height: 56, borderRadius: 8 }} />)}
+    </div>
+  )
+
+  const groups: Record<string, [string, any][]> = {}
+  for (const [key, item] of Object.entries(params)) {
+    const cat: string = item.meta.category
+    if (!groups[cat]) groups[cat] = []
+    groups[cat].push([key, item])
+  }
+
+  const restartDirtyCount = dirtyKeys.filter(k => !params[k]?.meta.live).length
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+      {/* Action bar */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 20, minHeight: 36 }}>
+        {anyDirty ? (
+          <>
+            <button className="btn btn-primary btn-sm" onClick={handleSaveAll} disabled={saving}>
+              {saving
+                ? <span className="spinner" style={{ width: 12, height: 12, borderWidth: 2 }} />
+                : <CheckCircle size={14} />}
+              Сохранить изменения ({dirtyKeys.length})
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={() => setDrafts({})}>Отмена</button>
+            {restartDirtyCount > 0 && (
+              <span style={{ fontSize: 12, color: '#d97706' }}>
+                ⚠ {restartDirtyCount} требуют перезапуска
+              </span>
+            )}
+          </>
+        ) : (
+          <span style={{ fontSize: 13, color: 'var(--c-text-3)' }}>
+            <span style={{ marginRight: 12 }}>
+              <span style={{ color: '#16a34a', fontWeight: 600 }}>●</span> live — вступает в силу сразу
+            </span>
+            <span>
+              <span style={{ color: '#d97706', fontWeight: 600 }}>●</span> restart — требует перезапуска сервера
+            </span>
+          </span>
+        )}
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={handleResetAll}
+          disabled={!anyCustom || resetting}
+          style={{ marginLeft: 'auto', opacity: anyCustom ? 1 : 0.35 }}>
+          <RotateCcw size={13} /> Сброс всех настроек
+        </button>
+      </div>
+
+      {Object.entries(groups).map(([cat, entries]) => (
+        <div key={cat} style={{ marginBottom: 28 }}>
+          <div style={{
+            fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
+            letterSpacing: '0.08em', color: 'var(--c-text-3)',
+            paddingBottom: 8, borderBottom: '1px solid var(--c-border-solid)',
+          }}>
+            {CATEGORY_LABELS[cat] ?? cat}
+          </div>
+
+          {entries.map(([key, item], idx) => {
+            const meta = item.meta
+            const draft = getDraft(key)
+            const dirty = isDirtyKey(key)
+            return (
+              <div key={key} style={{
+                display: 'grid',
+                gridTemplateColumns: '1fr auto',
+                gap: 24,
+                padding: '13px 0',
+                borderBottom: idx < entries.length - 1 ? '1px solid var(--c-border)' : undefined,
+                alignItems: 'center',
+              }}>
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+                    <span style={{ fontSize: 14, fontWeight: 600, color: dirty ? 'var(--c-primary)' : 'var(--c-text)' }}>
+                      {meta.label}
+                    </span>
+                    <span style={{ fontSize: 11, color: meta.live ? '#16a34a' : '#d97706', fontWeight: 600 }}>
+                      ● {meta.live ? 'live' : 'restart'}
+                    </span>
+                    {item.isCustom && !dirty && (
+                      <span style={{ fontSize: 11, color: 'var(--c-text-3)' }}>· изменён</span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 12.5, color: 'var(--c-text-3)', marginTop: 2, lineHeight: 1.4 }}>
+                    {meta.description}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: 'var(--c-text-3)', marginTop: 3, opacity: 0.65 }}>
+                    по умолч.&nbsp;<strong style={{ fontWeight: 600 }}>{meta.default}</strong>
+                    {meta.unit ? ' ' + meta.unit : ''}
+                    &nbsp;·&nbsp;диапазон {meta.min}–{meta.max}
+                    {meta.unit ? ' ' + meta.unit : ''}
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                  {meta.min === 0 && meta.max === 1 ? (
+                    <RagModeToggle value={draft} onChange={v => setDraft(key, v)} />
+                  ) : (
+                    <>
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => setDraft(key, Math.max(meta.min, draft - 1))}
+                        disabled={draft <= meta.min}
+                        style={{ width: 28, height: 28, padding: 0, fontSize: 17, lineHeight: 1 }}>−</button>
+                      <input
+                        type="number"
+                        value={draft}
+                        min={meta.min}
+                        max={meta.max}
+                        onChange={e => setDraft(key, Math.max(meta.min, Math.min(meta.max, parseInt(e.target.value) || meta.min)))}
+                        className="input"
+                        style={{ width: 58, textAlign: 'center', fontWeight: 700, fontSize: 14, fontFamily: 'ui-monospace, monospace', padding: '4px 6px' }}
+                      />
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => setDraft(key, Math.min(meta.max, draft + 1))}
+                        disabled={draft >= meta.max}
+                        style={{ width: 28, height: 28, padding: 0, fontSize: 17, lineHeight: 1 }}>+</button>
+                    </>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+
 export default function Settings() {
-  const [tab, setTab] = useState<'general' | 'prompts'>('general')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const initialTab = searchParams.get('tab') as any ?? 'general'
+  const [tab, setTab] = useState<'general' | 'prompts' | 'system' | 'platform'>(initialTab)
+
+  const changeTab = (t: typeof tab) => {
+    setTab(t)
+    setSearchParams(t !== 'general' ? { tab: t } : {}, { replace: true })
+  }
 
   const { data: usage, isLoading: usageLoading, refetch: refetchUsage } = useQuery({
     queryKey: ['ai-usage'],
@@ -175,8 +421,10 @@ export default function Settings() {
       </div>
 
       <div className="segmented" style={{ marginBottom: 24 }}>
-        <button className={tab === 'general' ? 'active' : ''} onClick={() => setTab('general')}>Использование</button>
-        <button className={tab === 'prompts' ? 'active' : ''} onClick={() => setTab('prompts')}>Промпты ИИ</button>
+        <button className={tab === 'general'  ? 'active' : ''} onClick={() => changeTab('general')}>Использование</button>
+        <button className={tab === 'platform' ? 'active' : ''} onClick={() => changeTab('platform')}>Состояние платформы</button>
+        <button className={tab === 'prompts'  ? 'active' : ''} onClick={() => changeTab('prompts')}>Промпты ИИ</button>
+        <button className={tab === 'system'   ? 'active' : ''} onClick={() => changeTab('system')}>Системные параметры</button>
       </div>
 
       {tab === 'general' && (
@@ -214,7 +462,7 @@ export default function Settings() {
                   <div className="progress-bar-fill teal" style={{ width: `${Math.min(100, creditPct)}%`, transition: 'width 0.6s ease' }} />
                 </div>
 
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginTop: 18, paddingTop: 18, borderTop: '1px solid var(--c-border-solid)' }}>
+                <div className="grid-4" style={{ marginTop: 18, paddingTop: 18, borderTop: '1px solid var(--c-border-solid)' }}>
                   {[
                     { label: 'Осталось токенов', value: formatNum(remaining) },
                     { label: 'Запросов всего', value: totalCalls },
@@ -230,7 +478,7 @@ export default function Settings() {
 
                 <div style={{ marginTop: 18, paddingTop: 18, borderTop: '1px solid var(--c-border-solid)' }}>
                   <p style={{ fontSize: 12, fontWeight: 700, color: 'var(--c-text-3)', textTransform: 'uppercase', letterSpacing: '0.05em', margin: '0 0 12px' }}>Этот месяц</p>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+                  <div className="grid-3" style={{ gap: 12 }}>
                     {[
                       { label: 'Запросов', value: monthCalls },
                       { label: 'Входящих', value: formatNum(monthIn) },
@@ -260,8 +508,8 @@ export default function Settings() {
 
             <div style={{ marginTop: 18, paddingTop: 18, borderTop: '1px solid var(--c-border-solid)', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
               {[
-                { label: 'Модель проверки', value: 'claude-haiku-4-5' },
-                { label: 'Модель отчётов', value: 'claude-sonnet-4-6' },
+                { label: 'Модель проверки', value: 'claude-haiku-4.5' },
+                { label: 'Модель отчётов', value: 'claude-sonnet-4.6' },
                 { label: 'Платформа', value: 'good-teach.itgen.io' },
                 { label: 'База данных', value: 'PostgreSQL 16' },
               ].map(({ label, value }) => (
@@ -275,8 +523,23 @@ export default function Settings() {
         </div>
       )}
 
+      {tab === 'platform' && <PlatformTab />}
+      {tab === 'system' && <SystemTab />}
+
       {tab === 'prompts' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {/* Info */}
+          <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start', padding: '14px 18px', background: 'var(--c-surface-2)', border: '1px solid var(--c-border-solid)', borderRadius: 14 }}>
+            <span style={{ width: 36, height: 36, borderRadius: 10, background: 'var(--c-teal-light)', color: 'var(--c-teal)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+              <Zap size={18} />
+            </span>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--c-text)', marginBottom: 3 }}>Промпты применяются к каждой проверке</div>
+              <p style={{ fontSize: 13, color: 'var(--c-text-3)', margin: 0, lineHeight: 1.55 }}>
+                Изменения вступают в силу в течение 5 минут (кэш). <strong>Системный промпт</strong> влияет на то, как ИИ оценивает ответ. <strong>Промпты отчёта</strong> — на комментарии в итоговом отчёте.
+              </p>
+            </div>
+          </div>
           {/* Warning */}
           <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start', padding: '14px 18px', background: 'var(--c-warn-light)', border: '1px solid #fde68a', borderRadius: 14 }}>
             <AlertTriangle size={19} color="var(--c-warn)" style={{ flexShrink: 0, marginTop: 1 }} />

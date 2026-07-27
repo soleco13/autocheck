@@ -6,7 +6,7 @@ import {
   extractJwtFromEditorInput,
 } from './session-fetcher';
 import { saveAnswers } from './answer-parser';
-import { checkAnswer } from './ai-checker';
+import { checkAnswer, checkAnswersBatch } from './ai-checker';
 import { generateReport } from './report-generator';
 import { getCheckQueue, PRIORITY, CheckJobData, isRedisQueueCapable } from '../queue';
 import { getDecryptedToken } from './auth';
@@ -20,9 +20,12 @@ export interface CheckInput {
   trainerToken?: string;
 }
 
-// How many answers to grade with the AI in parallel. Kept modest to respect the
-// upstream Anthropic proxy's rate limits while still cutting wall-clock time.
-const AI_CONCURRENCY = parseInt(process.env.AI_CONCURRENCY || '5', 10);
+import { configStore } from '../lib/config-store';
+
+// AI_CONCURRENCY is read dynamically from configStore so UI changes take effect immediately
+function getAiConcurrency() {
+  try { return configStore.get('ai_concurrency'); } catch { return parseInt(process.env.AI_CONCURRENCY || '5', 10); }
+}
 
 // Runs `fn` over `items` with at most `limit` promises in flight at once.
 export async function mapWithConcurrency<T>(
@@ -117,19 +120,30 @@ export async function resolveSession(
 // Used by both the synchronous route and the background worker.
 export async function runCheckPipeline(
   input: CheckInput,
+  onProgress?: (done: number, total: number) => void,
 ): Promise<{ sessionId: string; reportId: string }> {
   const { sessionId, rawState } = await resolveSession(input);
 
   await saveAnswers(sessionId, rawState);
 
-  const answersResult = await db.query('SELECT id FROM answers WHERE session_id = $1', [sessionId]);
-  await mapWithConcurrency(answersResult.rows, AI_CONCURRENCY, async (answer) => {
-    try {
-      await checkAnswer(answer.id);
-    } catch (err) {
-      console.error('[check-runner] Error checking answer', answer.id, err);
-    }
-  });
+  // Free raw_state TOAST storage — data is now in answers table, JSONB not needed.
+  // Avg 226KB per session; at scale this prevents multi-GB TOAST bloat.
+  db.query('UPDATE student_sessions SET raw_state = NULL WHERE id = $1', [sessionId])
+    .catch(() => {});
+
+  // Batch mode: one API call for all open_answer tasks in the session (8x fewer API slots).
+  // Falls back to individual checkAnswer() per item if batch parse fails.
+  try {
+    await checkAnswersBatch(sessionId, onProgress);
+  } catch (err) {
+    console.error('[check-runner] Batch check failed, falling back to individual:', err);
+    const answersResult = await db.query('SELECT id FROM answers WHERE session_id = $1', [sessionId]);
+    await mapWithConcurrency(answersResult.rows, getAiConcurrency(), async (answer) => {
+      try { await checkAnswer(answer.id); } catch (e) {
+        console.error('[check-runner] Error checking answer', answer.id, e);
+      }
+    });
+  }
 
   const reportId = await generateReport(sessionId);
   return { sessionId, reportId };
@@ -143,6 +157,159 @@ export interface EnqueueParams {
   trainerToken?: string;
   source?: 'manual' | 'prefetch';
   dedupe?: boolean;   // skip if a report already exists or a job is already pending
+}
+
+// Enqueues a batch of checks efficiently:
+// - Single-query dedup for all items at once
+// - Single INSERT for all new check_jobs rows
+// - Background processing with controlled concurrency (inline) or BullMQ (Redis)
+// Designed for 1000+ items.
+export async function enqueueCheckBatch(
+  items: EnqueueParams[],
+): Promise<{ jobIds: string[]; skipped: number }> {
+  if (items.length === 0) return { jobIds: [], skipped: 0 };
+
+  const useQueue = await isRedisQueueCapable();
+  let skipped = 0;
+  let toProcess = [...items];
+
+  // ── Batch dedup ─────────────────────────────────────────────────────────────
+  const dedupeItems = items.filter(p => p.dedupe && p.platformMaterialId);
+  if (dedupeItems.length > 0) {
+    const teacherIds = [...new Set(dedupeItems.map(p => p.teacherId))];
+    const studentIds = [...new Set(dedupeItems.map(p => p.studentId))];
+    const materialIds = [...new Set(dedupeItems.map(p => p.platformMaterialId!))];
+
+    const [reportedRes, activeRes] = await Promise.all([
+      db.query(
+        `SELECT ss.student_id, cs.platform_material_id
+         FROM reports r
+         JOIN student_sessions ss ON ss.id = r.session_id
+         JOIN control_sheets cs ON cs.id = ss.control_sheet_id
+         WHERE ss.teacher_id = ANY($1::uuid[])
+           AND ss.student_id = ANY($2::uuid[])
+           AND cs.platform_material_id = ANY($3::text[])`,
+        [teacherIds, studentIds, materialIds],
+      ),
+      db.query(
+        `SELECT student_id, platform_material_id
+         FROM check_jobs
+         WHERE teacher_id = ANY($1::uuid[])
+           AND student_id = ANY($2::uuid[])
+           AND platform_material_id = ANY($3::text[])
+           AND status IN ('queued', 'processing')`,
+        [teacherIds, studentIds, materialIds],
+      ),
+    ]);
+
+    const pairKey = (sId: string, mId: string) => `${sId}:${mId}`;
+    const reported = new Set(reportedRes.rows.map((r: any) => pairKey(r.student_id, r.platform_material_id)));
+    const active   = new Set(activeRes.rows.map((r: any) => pairKey(r.student_id, r.platform_material_id)));
+
+    toProcess = items.filter(p => {
+      if (!p.dedupe || !p.platformMaterialId) return true;
+      const key = pairKey(p.studentId, p.platformMaterialId);
+      if (reported.has(key) || active.has(key)) { skipped++; return false; }
+      return true;
+    });
+  }
+
+  if (toProcess.length === 0) return { jobIds: [], skipped };
+
+  // ── Redis / BullMQ path ─────────────────────────────────────────────────────
+  if (useQueue) {
+    // Batch-insert all job rows first, then enqueue to BullMQ
+    const source = toProcess[0].source || 'prefetch';
+    const vals: any[] = [];
+    const placeholders = toProcess.map((p, i) => {
+      const b = i * 4;
+      vals.push(p.teacherId, p.studentId, p.platformMaterialId || null, p.source || source);
+      return `($${b + 1}, $${b + 2}, $${b + 3}, 'queued', $${b + 4})`;
+    });
+    const insertResult = await db.query(
+      `INSERT INTO check_jobs (teacher_id, student_id, platform_material_id, status, source)
+       VALUES ${placeholders.join(', ')} RETURNING id`,
+      vals,
+    );
+    const jobIds: string[] = insertResult.rows.map((r: any) => r.id);
+
+    // addBulk() is a single Redis pipeline op — much more efficient than
+    // Promise.all(N × queue.add()) for large batches.
+    const queue = getCheckQueue();
+    try {
+      await queue.addBulk(
+        toProcess.map((p, i) => ({
+          name: 'check',
+          data: {
+            checkJobId: jobIds[i],
+            teacherId: p.teacherId,
+            studentId: p.studentId,
+            editorUrl: p.editorUrl,
+            platformMaterialId: p.platformMaterialId,
+            trainerToken: p.trainerToken,
+            source: p.source || 'prefetch',
+          } satisfies CheckJobData,
+          opts: {
+            jobId: jobIds[i],
+            priority: p.source === 'prefetch' ? PRIORITY.prefetch : PRIORITY.manual,
+          },
+        })),
+      );
+    } catch (err: any) {
+      console.warn('[enqueueCheckBatch] addBulk failed, falling back to inline:', err?.message);
+      // Inline fallback: process all with controlled concurrency
+      setImmediate(() => {
+        const concurrency = Math.max(1, configStore.get('inline_bulk_concurrency'));
+        mapWithConcurrency(
+          toProcess.map((p, i) => ({ checkJobId: jobIds[i], input: { teacherId: p.teacherId, studentId: p.studentId, editorUrl: p.editorUrl, platformMaterialId: p.platformMaterialId, trainerToken: p.trainerToken } as CheckInput })),
+          concurrency,
+          ({ checkJobId, input }) => runInline(checkJobId, input),
+        ).catch(() => {});
+      });
+    }
+
+    return { jobIds, skipped };
+  }
+
+  // ── Inline fallback path ────────────────────────────────────────────────────
+  // Batch-insert all job rows in one statement, return jobIds immediately,
+  // then process in background with controlled concurrency so we don't fire
+  // N simultaneous platform requests.
+  const source = toProcess[0].source || 'prefetch';
+  const vals: any[] = [];
+  const placeholders = toProcess.map((p, i) => {
+    const b = i * 4;
+    vals.push(p.teacherId, p.studentId, p.platformMaterialId || null, p.source || source);
+    return `($${b + 1}, $${b + 2}, $${b + 3}, 'queued', $${b + 4})`;
+  });
+  const insertResult = await db.query(
+    `INSERT INTO check_jobs (teacher_id, student_id, platform_material_id, status, source)
+     VALUES ${placeholders.join(', ')} RETURNING id`,
+    vals,
+  );
+  const jobIds: string[] = insertResult.rows.map((r: any) => r.id);
+
+  const pendingJobs = toProcess.map((p, i) => ({
+    checkJobId: jobIds[i],
+    input: {
+      teacherId: p.teacherId,
+      studentId: p.studentId,
+      editorUrl: p.editorUrl,
+      platformMaterialId: p.platformMaterialId,
+      trainerToken: p.trainerToken,
+    } as CheckInput,
+  }));
+
+  // Fire-and-forget with controlled concurrency — don't block the HTTP response.
+  // configStore is read each call so UI changes take effect for new batches.
+  setImmediate(() => {
+    const concurrency = Math.max(1, configStore.get('inline_bulk_concurrency'));
+    mapWithConcurrency(pendingJobs, concurrency, ({ checkJobId, input }) =>
+      runInline(checkJobId, input),
+    ).catch(() => {});
+  });
+
+  return { jobIds, skipped };
 }
 
 // Runs the pipeline inline (no queue) and records the outcome on the check_jobs row.

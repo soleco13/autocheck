@@ -8,7 +8,7 @@ const EDIK_URL = 'wss://editor.good-teach.itgen.io/websocket';
 
 let client: any = null;
 let currentEdikToken: string | null = null;
-let edikAuthInProgress = false;
+const edikAuthInFlight = new Map<string, Promise<void>>();
 
 export function getEdikClient(): any {
   if (!client) {
@@ -29,7 +29,7 @@ export function getEdikClient(): any {
     client.on('disconnected', () => {
       logger.warn('[Edik DDP] disconnected');
       currentEdikToken = null;
-      edikAuthInProgress = false;
+      edikAuthInFlight.clear();
     });
     client.on('connected', () => logger.info('[Edik DDP] connected'));
   }
@@ -71,20 +71,25 @@ export async function loginToEdik(email: string, password: string): Promise<{ to
 export async function ensureEdikAuthenticated(edikResumeToken: string): Promise<void> {
   const c = getEdikClient();
   if (!c.connected) await connectEdik();
-  if (currentEdikToken === edikResumeToken && !edikAuthInProgress) return;
+  if (currentEdikToken === edikResumeToken) return;
 
-  edikAuthInProgress = true;
-  try {
+  const existing = edikAuthInFlight.get(edikResumeToken);
+  if (existing) return existing;
+
+  const p = (async () => {
     logger.debug('[Edik] Resume auth...');
-    const result = await c.call('login', { resume: edikResumeToken });
-    currentEdikToken = result.token || edikResumeToken;
-    logger.debug('[Edik] Resume auth OK');
-  } catch (err: any) {
-    currentEdikToken = null;
-    edikAuthInProgress = false;
-    throw new Error(`[Edik] Auth failed: ${err?.reason || err?.message || err}`);
-  }
-  edikAuthInProgress = false;
+    try {
+      const result = await c.call('login', { resume: edikResumeToken });
+      currentEdikToken = result.token || edikResumeToken;
+      logger.debug('[Edik] Resume auth OK');
+    } catch (err: any) {
+      currentEdikToken = null;
+      throw new Error(`[Edik] Auth failed: ${err?.reason || err?.message || err}`);
+    }
+  })().finally(() => edikAuthInFlight.delete(edikResumeToken));
+
+  edikAuthInFlight.set(edikResumeToken, p);
+  return p;
 }
 
 // getMaterialSessionState works WITHOUT user auth — JWT provides authorization.

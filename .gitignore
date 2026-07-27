@@ -21,6 +21,9 @@ logs/
 
 # Stray image artifacts at root only
 /pers_talk.png
+/i_dont_know.png
+/pers_hello.png
+/pers_hello1.png
 backend/server.log
 backend-dev.log
 backend-dev-err.log
@@ -44,12 +47,14 @@ ss3-*.png
 v3-*.png
 final-*.png
 
-# Redis binaries (Windows)
-redis/*.exe
-redis/*.pdb
-redis/*.dll
-redis/*.zip
-redis/*.docx
+# Redis (Windows binaries, local dev only)
+redis/
+
+# Local test data (uploaded student PDFs)
+backend/covers/
+
+# Secrets / local tokens
+token.txt
 
 # Misc root-level test files
 b1.json

@@ -8,7 +8,10 @@ const GENA_URL = 'wss://platform.good-teach.itgen.io/websocket';
 
 let client: any = null;
 let currentAuthToken: string | null = null;
-let authInProgress = false;
+// Per-token in-flight auth promises — prevents concurrent logins from racing.
+// If two requests come in with the same token while auth is in progress,
+// the second waits on the same Promise instead of issuing a duplicate login.
+const authInFlight = new Map<string, Promise<void>>();
 
 export function getGenaClient(): any {
   if (!client) {
@@ -29,7 +32,7 @@ export function getGenaClient(): any {
     client.on('disconnected', () => {
       console.warn('[Gena DDP] disconnected — clearing auth state');
       currentAuthToken = null;
-      authInProgress = false;
+      authInFlight.clear();
     });
     client.on('connected', () => console.log('[Gena DDP] connected'));
   }
@@ -71,20 +74,27 @@ export async function loginTeacher(email: string, password: string): Promise<Log
 async function ensureAuthenticated(loginToken: string): Promise<void> {
   const c = getGenaClient();
   if (!c.connected) await connectGena();
-  if (currentAuthToken === loginToken && !authInProgress) return;
+  if (currentAuthToken === loginToken) return;
 
-  authInProgress = true;
-  try {
+  // If auth for this exact token is already in flight, wait on that promise
+  // instead of issuing a duplicate login call (race-safe).
+  const existing = authInFlight.get(loginToken);
+  if (existing) return existing;
+
+  const p = (async () => {
     logger.debug('[Gena] Resume auth...');
-    const result = await c.call('login', { resume: loginToken });
-    currentAuthToken = result.token || loginToken;
-    logger.debug('[Gena] Resume auth OK');
-  } catch (err: any) {
-    currentAuthToken = null;
-    authInProgress = false;
-    throw new Error(`DDP auth failed: ${err?.reason || err?.message || err}`);
-  }
-  authInProgress = false;
+    try {
+      const result = await c.call('login', { resume: loginToken });
+      currentAuthToken = result.token || loginToken;
+      logger.debug('[Gena] Resume auth OK');
+    } catch (err: any) {
+      currentAuthToken = null;
+      throw new Error(`DDP auth failed: ${err?.reason || err?.message || err}`);
+    }
+  })().finally(() => authInFlight.delete(loginToken));
+
+  authInFlight.set(loginToken, p);
+  return p;
 }
 
 export async function callGena(loginToken: string, method: string, ...params: any[]): Promise<any> {
@@ -228,20 +238,20 @@ export async function getMaterialSessionJwt(
   return null;
 }
 
-// In-memory cache for material titles (30-min TTL)
-let _titleCacheTime = 0;
-let _titleCache: Map<string, string> | null = null;
-const TITLE_CACHE_TTL = 30 * 60 * 1000;
-
 /**
  * Returns a materialId → title map using getAllBranchesWithMaterialsBySkills.
- * Result is cached in memory for 30 minutes.
+ * Cached in Redis for 30 minutes — shared across all processes/restarts.
  */
+const TITLE_CACHE_KEY = 'gena:title-map';
+const TITLE_CACHE_TTL_S = 30 * 60;
+
 export async function getMaterialTitleMap(loginToken: string): Promise<Map<string, string>> {
-  const now = Date.now();
-  if (_titleCache && (now - _titleCacheTime) < TITLE_CACHE_TTL) {
-    return _titleCache;
-  }
+  const { cacheGet, cacheSet } = await import('../lib/redis-cache');
+
+  // Check Redis first
+  const cached = await cacheGet<Record<string, string>>(TITLE_CACHE_KEY);
+  if (cached) return new Map(Object.entries(cached));
+
   const map = new Map<string, string>();
   try {
     await ensureAuthenticated(loginToken);
@@ -257,8 +267,10 @@ export async function getMaterialTitleMap(loginToken: string): Promise<Map<strin
   } catch (err: any) {
     console.warn('[gena] getMaterialTitleMap failed:', err.message?.slice(0, 80));
   }
-  _titleCache = map;
-  _titleCacheTime = now;
+
+  if (map.size > 0) {
+    await cacheSet(TITLE_CACHE_KEY, Object.fromEntries(map), TITLE_CACHE_TTL_S);
+  }
   return map;
 }
 

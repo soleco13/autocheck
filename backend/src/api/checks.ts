@@ -1,28 +1,28 @@
 import { Router, Response } from 'express';
 import { requireAuth, AuthRequest } from '../middleware/auth-middleware';
 import { db } from '../db';
-import { enqueueCheckJob } from '../services/check-runner';
+import { enqueueCheckJob, enqueueCheckBatch, EnqueueParams } from '../services/check-runner';
 import { safeError } from '../lib/safe-error';
 import { logger } from '../lib/logger';
 import rateLimit from 'express-rate-limit';
+import { configStore } from '../lib/config-store';
 
 const router = Router();
 
-// Per-user rate limit on check endpoints: 30 checks/min per teacher
-// Keyed by teacherId extracted from the JWT (set by requireAuth before this runs)
+// Rate limits read from configStore on every request — changes in Settings UI take effect
+// immediately without a server restart (check_rate_per_min / bulk_rate_per_min params).
 const checkLimiter = rateLimit({
   windowMs: 60_000,
-  max: 30,
+  max: (_req: any) => configStore.get('check_rate_per_min'),
   keyGenerator: (req: any) => req.teacherId || req.ip,
   message: { error: 'Слишком много запросов на проверку. Подождите минуту.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// Stricter limit for bulk: 5 bulk requests/min per teacher
 const bulkLimiter = rateLimit({
   windowMs: 60_000,
-  max: 5,
+  max: (_req: any) => configStore.get('bulk_rate_per_min'),
   keyGenerator: (req: any) => req.teacherId || req.ip,
   message: { error: 'Слишком много массовых запросов. Подождите минуту.' },
   standardHeaders: true,
@@ -70,21 +70,23 @@ router.post('/', requireAuth, checkLimiter, async (req: AuthRequest, res: Respon
 });
 
 // POST /api/checks/bulk
-const BULK_MAX_ITEMS = 100;
-
+// Accepts up to bulk_max_items items, deduplicates in one batch query,
+// inserts all new check_jobs in one statement, and returns all jobIds immediately.
+// Processing happens in the background (BullMQ or inline with concurrency control).
 router.post('/bulk', requireAuth, bulkLimiter, async (req: AuthRequest, res: Response) => {
   const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
   if (rawItems.length === 0) {
     res.status(400).json({ error: 'items[] required' });
     return;
   }
-  if (rawItems.length > BULK_MAX_ITEMS) {
-    res.status(400).json({ error: `Максимум ${BULK_MAX_ITEMS} работ за один запрос.` });
+  const bulkMax = configStore.get('bulk_max_items');
+  if (rawItems.length > bulkMax) {
+    res.status(400).json({ error: `Максимум ${bulkMax} работ за один запрос.` });
     return;
   }
 
   // Verify all studentIds belong to this teacher in one query
-  const uniqueStudentIds = [...new Set(rawItems.map((it: any) => it?.studentId).filter(Boolean))];
+  const uniqueStudentIds = [...new Set(rawItems.map((it: any) => it?.studentId).filter(Boolean))] as string[];
   if (uniqueStudentIds.length > 0) {
     const owned = await db.query(
       `SELECT student_id FROM teacher_students
@@ -99,28 +101,105 @@ router.post('/bulk', requireAuth, bulkLimiter, async (req: AuthRequest, res: Res
     }
   }
 
-  const jobIds: string[] = [];
-  let skipped = 0;
-  for (const it of rawItems) {
-    if (!it?.studentId || !it?.materialId) continue;
-    try {
-      const { jobId, skipped: wasSkipped } = await enqueueCheckJob({
-        teacherId: req.teacherId!,
-        studentId: it.studentId,
-        editorUrl: it.materialId,
-        platformMaterialId: it.materialId,
-        trainerToken: it.trainerToken,
-        source: 'prefetch',
-        dedupe: true,
-      });
-      if (wasSkipped) skipped++;
-      else if (jobId) jobIds.push(jobId);
-    } catch (err: any) {
-      logger.warn({ studentId: it.studentId, err: safeError(err) }, '[bulk] enqueue failed');
-    }
-  }
+  const validItems: EnqueueParams[] = rawItems
+    .filter((it: any) => it?.studentId && it?.materialId)
+    .map((it: any) => ({
+      teacherId: req.teacherId!,
+      studentId: it.studentId,
+      editorUrl: it.materialId,
+      platformMaterialId: it.materialId,
+      trainerToken: it.trainerToken,
+      source: 'prefetch' as const,
+      dedupe: true,
+    }));
 
-  res.status(202).json({ enqueued: jobIds.length, skipped, jobIds });
+  try {
+    const { jobIds, skipped } = await enqueueCheckBatch(validItems);
+    res.status(202).json({ enqueued: jobIds.length, skipped, jobIds });
+  } catch (err: any) {
+    logger.error({ err }, '[bulk] enqueueCheckBatch failed');
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// GET /api/checks/jobs/active — returns queued/processing jobs grouped by student.
+// Only returns jobs updated within the last 30 minutes to avoid stale ghost banners.
+router.get('/jobs/active', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await db.query(
+      `SELECT student_id, array_agg(id ORDER BY created_at) AS job_ids, count(*)::int AS total
+       FROM check_jobs
+       WHERE teacher_id = $1
+         AND status IN ('queued', 'processing')
+         AND updated_at > NOW() - INTERVAL '30 minutes'
+       GROUP BY student_id`,
+      [req.teacherId],
+    );
+    res.json(result.rows.map((r: any) => ({
+      studentId: r.student_id,
+      jobIds: r.job_ids,
+      total: r.total,
+    })));
+  } catch (err: any) {
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// POST /api/checks/jobs/cancel — marks all queued/processing jobs for a student as cancelled
+// AND removes waiting jobs from the BullMQ Redis queue so workers stop picking them up.
+router.post('/jobs/cancel', requireAuth, async (req: AuthRequest, res: Response) => {
+  const { studentId } = req.body;
+  if (!studentId) { res.status(400).json({ error: 'studentId required' }); return; }
+  try {
+    const result = await db.query(
+      `UPDATE check_jobs
+       SET status = 'failed', error = 'Отменено пользователем', updated_at = NOW()
+       WHERE teacher_id = $1 AND student_id = $2 AND status IN ('queued', 'processing')
+       RETURNING id`,
+      [req.teacherId, studentId],
+    );
+
+    // Remove waiting/prioritized jobs from BullMQ so workers don't pick them up.
+    // Active jobs (currently processing) can't be removed mid-flight — the worker
+    // cancellation check in worker.ts handles those on the next DB status read.
+    if (result.rows.length > 0) {
+      try {
+        const { getCheckQueue, isRedisQueueCapable } = await import('../queue');
+        if (await isRedisQueueCapable()) {
+          const { Job } = await import('bullmq');
+          const queue = getCheckQueue();
+          await Promise.allSettled(
+            result.rows.map(async (row: any) => {
+              const job = await Job.fromId(queue, row.id);
+              if (job) await job.remove();
+            }),
+          );
+        }
+      } catch { /* BullMQ removal is best-effort; DB status is the source of truth */ }
+    }
+
+    res.json({ ok: true, cancelled: result.rows.length });
+  } catch (err: any) {
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// POST /api/checks/jobs/status — batch status for 1000+ job IDs in one DB query.
+// Body: { ids: string[] }  (max 1000)
+router.post('/jobs/status', requireAuth, async (req: AuthRequest, res: Response) => {
+  const ids: string[] = Array.isArray(req.body?.ids) ? req.body.ids.slice(0, 1000) : [];
+  if (ids.length === 0) { res.json([]); return; }
+  try {
+    const result = await db.query(
+      `SELECT id, status, error FROM check_jobs
+       WHERE id = ANY($1::uuid[]) AND teacher_id = $2`,
+      [ids, req.teacherId],
+    );
+    res.json(result.rows);
+  } catch (err: any) {
+    logger.error({ err }, 'Batch job status error');
+    res.status(500).json({ error: safeError(err) });
+  }
 });
 
 // GET /api/checks/jobs/:jobId

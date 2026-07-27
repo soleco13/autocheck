@@ -5,72 +5,88 @@ import { db } from '../db';
 import { syncStudentsForTeacher, syncClassroomsForTeacher } from '../services/session-fetcher';
 import { getDecryptedToken } from '../services/auth';
 import { getChildsMaterials, getMaterialTitleMap } from '../ddp/gena-client';
+import { cacheGet, cacheSet, cacheDel } from '../lib/redis-cache';
+import { configStore } from '../lib/config-store';
 
 const router = Router();
 
-// In-memory LRU cache for platform works data per (teacher, student)
-// TTL: 5 minutes, max 500 entries — prevents unbounded memory growth
-const worksCache = new Map<string, { data: any; at: number }>();
-const WORKS_TTL = 5 * 60_000;
-const WORKS_CACHE_MAX = 500;
-
-function worksCacheSet(key: string, value: { data: any; at: number }) {
-  if (worksCache.size >= WORKS_CACHE_MAX && !worksCache.has(key)) {
-    worksCache.delete(worksCache.keys().next().value!);  // evict oldest (Map is insertion-ordered)
-  }
-  worksCache.set(key, value);
-  // Periodic TTL cleanup every 50 writes
-  if (worksCache.size % 50 === 0) {
-    const now = Date.now();
-    for (const [k, v] of worksCache) if (now - v.at > WORKS_TTL) worksCache.delete(k);
-  }
+function getWorksTtlSeconds() {
+  try { return configStore.get('works_cache_ttl_min') * 60; } catch { return 300; }
 }
 
-router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
-  let syncError: string | null = null;
+function worksCacheKey(teacherId: string, studentId: string): string {
+  return `works:${teacherId}:${studentId}`;
+}
 
+// GET /api/students?sync=true&search=...&page=1&pageSize=50
+router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   if (req.query.sync === 'true') {
     try {
       await syncStudentsForTeacher(req.teacherId!);
     } catch (err: any) {
-      syncError = err.message;
       console.warn('Sync warning (returning cached data):', err.message);
     }
   }
 
   try {
-    // Use CTEs instead of correlated subqueries — avoids N×2 per-row lookups for 200+ students.
-    const result = await db.query(`
-      WITH grade_cte AS (
-        SELECT DISTINCT ON (ss.student_id)
-          ss.student_id,
-          cs.grade
-        FROM student_sessions ss
-        JOIN control_sheets cs ON cs.id = ss.control_sheet_id
-        WHERE ss.teacher_id = $1 AND cs.grade > 0
-        ORDER BY ss.student_id, ss.fetched_at DESC
-      ),
-      classroom_cte AS (
-        SELECT crs.student_id,
-               ARRAY_AGG(cr.name ORDER BY cr.name) AS classrooms
-        FROM classroom_students crs
-        JOIN classrooms cr ON cr.id = crs.classroom_id
-        WHERE cr.teacher_id = $1
-        GROUP BY crs.student_id
-      )
-      SELECT
-        s.id, s.platform_student_id, s.full_name, s.nickname, s.cached_at,
-        COALESCE(NULLIF(s.grade, 0), gc.grade) AS grade,
-        COALESCE(cc.classrooms, ARRAY[]::text[]) AS classrooms
-      FROM students s
-      JOIN teacher_students ts ON ts.student_id = s.id
-      LEFT JOIN grade_cte gc ON gc.student_id = s.id
-      LEFT JOIN classroom_cte cc ON cc.student_id = s.id
-      WHERE ts.teacher_id = $1
-      ORDER BY s.full_name
-    `, [req.teacherId]);
+    const search  = (req.query.search  as string || '').trim();
+    const page     = Math.max(1, parseInt(req.query.page     as string || '1',  10));
+    const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize as string || '200', 10)));
+    const offset   = (page - 1) * pageSize;
 
-    res.json(result.rows);
+    const conditions: string[] = ['ts.teacher_id = $1'];
+    const params: any[] = [req.teacherId];
+
+    if (search) {
+      params.push(`%${search}%`);
+      conditions.push(`(s.full_name ILIKE $${params.length} OR s.nickname ILIKE $${params.length})`);
+    }
+
+    const where = conditions.join(' AND ');
+    params.push(pageSize, offset);
+    const limitIdx  = params.length - 1;
+    const offsetIdx = params.length;
+
+    const [dataResult, countResult] = await Promise.all([
+      db.query(`
+        WITH grade_cte AS (
+          SELECT DISTINCT ON (ss.student_id) ss.student_id, cs.grade
+          FROM student_sessions ss
+          JOIN control_sheets cs ON cs.id = ss.control_sheet_id
+          WHERE ss.teacher_id = $1 AND cs.grade > 0
+          ORDER BY ss.student_id, ss.fetched_at DESC
+        ),
+        classroom_cte AS (
+          SELECT crs.student_id, ARRAY_AGG(cr.name ORDER BY cr.name) AS classrooms
+          FROM classroom_students crs
+          JOIN classrooms cr ON cr.id = crs.classroom_id
+          WHERE cr.teacher_id = $1
+          GROUP BY crs.student_id
+        )
+        SELECT
+          s.id, s.platform_student_id, s.full_name, s.nickname, s.cached_at,
+          COALESCE(NULLIF(s.grade, 0), gc.grade) AS grade,
+          COALESCE(cc.classrooms, ARRAY[]::text[]) AS classrooms
+        FROM students s
+        JOIN teacher_students ts ON ts.student_id = s.id
+        LEFT JOIN grade_cte gc ON gc.student_id = s.id
+        LEFT JOIN classroom_cte cc ON cc.student_id = s.id
+        WHERE ${where}
+        ORDER BY s.full_name
+        LIMIT $${limitIdx} OFFSET $${offsetIdx}
+      `, params),
+      db.query(`
+        SELECT COUNT(*) FROM students s
+        JOIN teacher_students ts ON ts.student_id = s.id
+        WHERE ${where}
+      `, params.slice(0, params.length - 2)),
+    ]);
+
+    const total = parseInt(countResult.rows[0].count, 10);
+    res.json({
+      students: dataResult.rows,
+      pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
+    });
   } catch (err: any) {
     console.error('Get students DB error:', err.message);
     res.status(500).json({ error: safeError(err) });
@@ -113,13 +129,13 @@ router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) =>
     let platformExtras: any[] = [];
     let platformError: string | null = null;
 
-    // Check server-side cache for platform data (avoids repeated DDP calls)
-    const cacheKey = `${req.teacherId}:${req.params.id}`;
-    const cached = worksCache.get(cacheKey);
-    if (!forceRefresh && cached && Date.now() - cached.at < WORKS_TTL) {
-      platformExtras = cached.data.extras;
-      platformError = cached.data.error;
-    } else
+    // Redis cache for platform data — survives restarts and shared across processes
+    const cacheKey = worksCacheKey(req.teacherId!, req.params.id);
+    if (!forceRefresh) {
+      const hit = await cacheGet<{ extras: any[]; error: string | null }>(cacheKey);
+      if (hit) { platformExtras = hit.extras; platformError = hit.error; }
+    }
+    if (forceRefresh || (platformExtras.length === 0 && !platformError))
     try {
       const [studentRow, teacherRow] = await Promise.all([
         db.query('SELECT platform_student_id FROM students WHERE id = $1', [req.params.id]),
@@ -176,8 +192,8 @@ router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) =>
       console.warn('[works] Platform fetch error:', err.message);
     }
 
-    // Store platform result in cache (even errors, to avoid hammering the platform)
-    worksCacheSet(cacheKey, { data: { extras: platformExtras, error: platformError }, at: Date.now() });
+    // Store in Redis cache (even errors, to avoid hammering the platform)
+    await cacheSet(cacheKey, { extras: platformExtras, error: platformError }, getWorksTtlSeconds());
 
     res.json({ works: [...sessions, ...platformExtras], platformError });
   } catch (err: any) {

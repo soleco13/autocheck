@@ -98,7 +98,7 @@ export default function Dashboard() {
   const handleSync = async () => {
     setSyncing(true)
     try {
-      await getStudents(true)
+      await getStudents({ sync: true })
       qc.invalidateQueries({ queryKey: ['students'] })
       toast.success('Список учеников обновлён')
     } catch (err: any) {
@@ -201,7 +201,7 @@ export default function Dashboard() {
 
       {/* Student list */}
       {isLoading ? (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+        <div className="grid-3">
           {Array.from({ length: 9 }).map((_, i) => (
             <div key={i} className="card card-pad">
               <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 14 }}>
@@ -223,7 +223,7 @@ export default function Dashboard() {
           </p>
         </div>
       ) : view === 'grid' ? (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
+        <div className="grid-3">
           {filtered.map((s: any) => (
             <StudentGridCard key={s.id} student={s} onClick={() => navigate(`/students/${s.id}`)} />
           ))}

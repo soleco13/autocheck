@@ -5,9 +5,9 @@ dotenv.config();
 
 export const db = new Pool({
   connectionString: process.env.DATABASE_URL,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  max: 40,                   // was 20; raised to handle 5 workers × 5 AI concurrent + overhead
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 3_000,
 });
 
 db.on('error', (err) => {

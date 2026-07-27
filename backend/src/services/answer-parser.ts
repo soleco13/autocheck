@@ -428,6 +428,14 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
               const checkedTexts = allOptions.filter(o => o.isChecked).map(o => o.text);
               const correctTexts = allOptions.filter(o => o.isCorrect).map(o => o.text);
 
+              // Platform isSolved (securedVars) is transient — available right after session completion
+              // but absent on re-check. Fall back to local comparison when unavailable.
+              const platformSolved: boolean | null = secResult?.isSolved ?? null;
+              const locallyCorrect: boolean | null = correctIds.size > 0
+                ? (checked.length === correctIds.size && checked.every((id: string) => correctIds.has(id)))
+                : null;
+              const isSolved = platformSolved ?? locallyCorrect;
+
               const qCtx = getSlideContext(slide, obj, CText);
               tasks.push({
                 componentId: comp.id,
@@ -436,7 +444,7 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
                 studentAnswer: checkedTexts.join(', '),
                 studentAnswerStructured: {
                   allOptions,
-                  _isSolved: secResult?.isSolved ?? null,
+                  _isSolved: isSolved,
                   _slideNum: slideNum,
                   _slideProblem: qCtx.problem || null,
                   _answerKey: qCtx.answerKey || null,
@@ -503,6 +511,27 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
           correctAnswer: slideDropdowns.map(d => `${d.questionText}: ${d.correctAnswer}`).join('\n'),
           maxScore: slideDropdowns.length,
         });
+      }
+    }
+
+    // Annotate tasks that share the same question_text on the same slide so the AI
+    // checker knows "this is part N of M" and doesn't expect a full compound answer.
+    const groupCounts = new Map<string, number>();
+    for (const task of tasks) {
+      const sn = task.studentAnswerStructured?._slideNum ?? null;
+      const key = `${sn}::${task.questionText || ''}`;
+      groupCounts.set(key, (groupCounts.get(key) ?? 0) + 1);
+    }
+    const groupIdx = new Map<string, number>();
+    for (const task of tasks) {
+      const sn = task.studentAnswerStructured?._slideNum ?? null;
+      const key = `${sn}::${task.questionText || ''}`;
+      const total = groupCounts.get(key) ?? 1;
+      if (total > 1 && task.studentAnswerStructured) {
+        const idx = (groupIdx.get(key) ?? 0) + 1;
+        groupIdx.set(key, idx);
+        task.studentAnswerStructured._partIndex = idx;
+        task.studentAnswerStructured._totalParts = total;
       }
     }
 

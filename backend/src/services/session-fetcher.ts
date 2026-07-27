@@ -40,39 +40,51 @@ export async function syncStudentsForTeacher(teacherId: string): Promise<void> {
 
   console.log(`[sync] Syncing ${children.length} students for teacher ${teacherId}`);
 
-  for (const child of children) {
-    const platformStudentId = child._id || child.userId || child.social__id || child.id;
-    if (!platformStudentId) continue;
-
+  // Parse all student records first
+  const parsed = children.map(child => {
+    const platformStudentId: string = child._id || child.userId || child.social__id || child.id || '';
     const firstName = child.firstName || child.profile?.firstName || '';
     const lastName  = child.lastName  || child.profile?.lastName  || '';
     const constructedName = [firstName, lastName].filter(Boolean).join(' ');
-    const fullName = child.profile?.name || child.social__name || child.name || constructedName || 'Unknown';
-    const nickname = child.social__nickname || child.profile?.nickname || null;
-    const grade = child.grade || child.classNumber || child.profile?.grade || null;
+    const fullName: string = child.profile?.name || child.social__name || child.name || constructedName || 'Unknown';
+    const nickname: string | null = child.social__nickname || child.profile?.nickname || null;
+    const grade: number | null = child.grade || child.classNumber || child.profile?.grade || null;
+    return { platformStudentId, fullName, nickname, grade };
+  }).filter(c => c.platformStudentId);
 
-    await db.query(`
-      INSERT INTO students (platform_student_id, full_name, nickname, grade, cached_at)
-      VALUES ($1, $2, $3, $4, NOW())
-      ON CONFLICT (platform_student_id) DO UPDATE SET
-        full_name = EXCLUDED.full_name,
-        nickname = EXCLUDED.nickname,
-        -- preserve existing grade if platform doesn't send one
-        grade = COALESCE(EXCLUDED.grade, students.grade),
-        cached_at = NOW()
-    `, [platformStudentId, fullName, nickname, grade]);
+  if (parsed.length === 0) return;
 
-    const studentResult = await db.query(
-      'SELECT id FROM students WHERE platform_student_id = $1',
-      [platformStudentId]
-    );
-    if (!studentResult.rows[0]) continue;
+  // Bulk upsert all students in one query — replaces N×3 queries with 2 total
+  const vals: any[] = [];
+  const placeholders = parsed.map((c, i) => {
+    const b = i * 4;
+    vals.push(c.platformStudentId, c.fullName, c.nickname, c.grade);
+    return `($${b+1}, $${b+2}, $${b+3}, $${b+4}, NOW())`;
+  });
 
+  const inserted = await db.query(`
+    INSERT INTO students (platform_student_id, full_name, nickname, grade, cached_at)
+    VALUES ${placeholders.join(',')}
+    ON CONFLICT (platform_student_id) DO UPDATE SET
+      full_name  = EXCLUDED.full_name,
+      nickname   = EXCLUDED.nickname,
+      grade      = COALESCE(EXCLUDED.grade, students.grade),
+      cached_at  = NOW()
+    RETURNING id, platform_student_id
+  `, vals);
+
+  // Bulk upsert teacher_students in one query
+  if (inserted.rows.length > 0) {
+    const tsVals: any[] = [teacherId];
+    const tsPlaceholders = inserted.rows.map((r: any, i: number) => {
+      tsVals.push(r.id);
+      return `($1, $${i + 2})`;
+    });
     await db.query(`
       INSERT INTO teacher_students (teacher_id, student_id)
-      VALUES ($1, $2)
+      VALUES ${tsPlaceholders.join(',')}
       ON CONFLICT DO NOTHING
-    `, [teacherId, studentResult.rows[0].id]);
+    `, tsVals);
   }
 
   // Backfill grade for students that still have NULL grade,
@@ -198,14 +210,32 @@ export async function fetchSessionStateByJwt(
   // Extract materialId: prefer caller-provided value (from getChildsMaterials), then baseState uid
   const materialId: string = knownMaterialId || rawState.baseState?.__meta?.uid || 'unknown';
 
-  // Try to get title via getMaterialBySession (requires Edik auth, may return null)
-  // Fallback: use title map from Gena's getAllBranchesWithMaterialsBySkills
+  // Title resolution — cheapest source first to minimise Edik calls under bulk load.
+  // 1. DB cache: if this material was checked before, reuse the stored title (7-day TTL).
+  //    This alone eliminates >90% of Edik title calls for re-checks.
+  // 2. Edik getMaterialBySession (requires auth — only called on cache miss).
+  // 3. Gena title map fallback.
   let title = 'Unknown';
-  try {
-    const edikToken = await getDecryptedEdikToken(teacherId);
-    const material = await getMaterialBySession(jwt, edikToken || undefined);
-    if (material?.title) title = material.title;
-  } catch { /* title is optional */ }
+  if (materialId && materialId !== 'unknown') {
+    try {
+      const cached = await db.query(
+        `SELECT title FROM control_sheets
+         WHERE platform_material_id = $1 AND cached_at > NOW() - INTERVAL '7 days'`,
+        [materialId],
+      );
+      if (cached.rows[0]?.title && cached.rows[0].title !== 'Unknown') {
+        title = cached.rows[0].title;
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  if (title === 'Unknown') {
+    try {
+      const edikToken = await getDecryptedEdikToken(teacherId);
+      const material = await getMaterialBySession(jwt, edikToken || undefined);
+      if (material?.title) title = material.title;
+    } catch { /* title is optional */ }
+  }
 
   if (title === 'Unknown' || !title) {
     try {
@@ -220,19 +250,18 @@ export async function fetchSessionStateByJwt(
 
   const parsed = parseMaterialTitle(title);
 
-  await db.query(`
+  const csResult = await db.query(`
     INSERT INTO control_sheets (platform_material_id, title, grade, subject_code, number, topic, cached_at)
     VALUES ($1, $2, $3, $4, $5, $6, NOW())
     ON CONFLICT (platform_material_id) DO UPDATE SET
-      title = EXCLUDED.title,
-      grade = EXCLUDED.grade,
+      title        = EXCLUDED.title,
+      grade        = EXCLUDED.grade,
       subject_code = EXCLUDED.subject_code,
-      number = EXCLUDED.number,
-      topic = EXCLUDED.topic,
-      cached_at = NOW()
+      number       = EXCLUDED.number,
+      topic        = EXCLUDED.topic,
+      cached_at    = NOW()
+    RETURNING id
   `, [materialId, title, parsed?.grade || 0, parsed?.subjectCode || 'XX', parsed?.number || 0, parsed?.topic || title]);
-
-  const csResult = await db.query('SELECT id FROM control_sheets WHERE platform_material_id = $1', [materialId]);
   const controlSheetId = csResult.rows[0].id;
 
   // Extract msid from JWT payload
@@ -245,19 +274,35 @@ export async function fetchSessionStateByJwt(
   const expires = new Date();
   expires.setFullYear(expires.getFullYear() + 10);
 
-  // Upsert: update existing session if same msid exists, otherwise insert
+  // Reuse existing session for this student+material to ensure re-checks update the same report.
+  // Priority: (1) same platform_session_id (msid), (2) same student+control_sheet, (3) insert new.
   let sessionId: string;
-  if (msid) {
-    const existing = await db.query(
-      'SELECT id FROM student_sessions WHERE platform_session_id = $1',
-      [msid]
+
+  // Try by msid first
+  const byMsid = msid
+    ? await db.query('SELECT id FROM student_sessions WHERE platform_session_id = $1 LIMIT 1', [msid])
+    : { rows: [] };
+
+  if (byMsid.rows[0]) {
+    await db.query(
+      'UPDATE student_sessions SET raw_state = $1, jwt_token = $2, fetched_at = NOW() WHERE id = $3',
+      [JSON.stringify(rawState), jwt, byMsid.rows[0].id]
     );
-    if (existing.rows[0]) {
+    sessionId = byMsid.rows[0].id;
+  } else {
+    // Fallback: reuse the most recent session for same student+material
+    const byPair = await db.query(
+      `SELECT id FROM student_sessions
+       WHERE student_id = $1 AND control_sheet_id = $2
+       ORDER BY fetched_at DESC LIMIT 1`,
+      [studentId, controlSheetId]
+    );
+    if (byPair.rows[0]) {
       await db.query(
-        'UPDATE student_sessions SET raw_state = $1, fetched_at = NOW() WHERE id = $2',
-        [JSON.stringify(rawState), existing.rows[0].id]
+        'UPDATE student_sessions SET platform_session_id = $1, jwt_token = $2, raw_state = $3, fetched_at = NOW() WHERE id = $4',
+        [msid, jwt, JSON.stringify(rawState), byPair.rows[0].id]
       );
-      sessionId = existing.rows[0].id;
+      sessionId = byPair.rows[0].id;
     } else {
       const ins = await db.query(`
         INSERT INTO student_sessions (platform_session_id, jwt_token, jwt_expires_at, control_sheet_id, student_id, teacher_id, raw_state, fetched_at)
@@ -265,12 +310,6 @@ export async function fetchSessionStateByJwt(
       `, [msid, jwt, expires, controlSheetId, studentId, teacherId, JSON.stringify(rawState)]);
       sessionId = ins.rows[0].id;
     }
-  } else {
-    const ins = await db.query(`
-      INSERT INTO student_sessions (platform_session_id, jwt_token, jwt_expires_at, control_sheet_id, student_id, teacher_id, raw_state, fetched_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING id
-    `, [null, jwt, expires, controlSheetId, studentId, teacherId, JSON.stringify(rawState)]);
-    sessionId = ins.rows[0].id;
   }
 
   return { sessionId, rawState };
@@ -328,17 +367,18 @@ export async function fetchSessionState(
   const title = material?.title || 'Unknown';
   const parsed = parseMaterialTitle(title);
 
-  // Ensure control_sheet exists
-  await db.query(`
+  // Upsert control_sheet, get id in one round-trip
+  const csResult = await db.query(`
     INSERT INTO control_sheets (platform_material_id, title, grade, subject_code, number, topic, cached_at)
     VALUES ($1, $2, $3, $4, $5, $6, NOW())
     ON CONFLICT (platform_material_id) DO UPDATE SET
-      title = EXCLUDED.title,
-      grade = EXCLUDED.grade,
+      title        = EXCLUDED.title,
+      grade        = EXCLUDED.grade,
       subject_code = EXCLUDED.subject_code,
-      number = EXCLUDED.number,
-      topic = EXCLUDED.topic,
-      cached_at = NOW()
+      number       = EXCLUDED.number,
+      topic        = EXCLUDED.topic,
+      cached_at    = NOW()
+    RETURNING id
   `, [
     platformMaterialId,
     title,
@@ -347,11 +387,6 @@ export async function fetchSessionState(
     parsed?.number || 0,
     parsed?.topic || title,
   ]);
-
-  const csResult = await db.query(
-    'SELECT id FROM control_sheets WHERE platform_material_id = $1',
-    [platformMaterialId]
-  );
   const controlSheetId = csResult.rows[0].id;
 
   // Get session state with student answers
@@ -367,18 +402,42 @@ export async function fetchSessionState(
     } catch {}
   }
 
-  // Save session
+  // Reuse existing session for same student+material (re-check updates the same report).
   const expires = new Date();
-  expires.setFullYear(expires.getFullYear() + 1); // 1 year as safe default
+  expires.setFullYear(expires.getFullYear() + 1);
 
-  const sessionResult = await db.query(`
-    INSERT INTO student_sessions (platform_session_id, jwt_token, jwt_expires_at, control_sheet_id, student_id, teacher_id, raw_state, fetched_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-    RETURNING id
-  `, [msid, jwtToken, expires, controlSheetId, studentId, teacherId, JSON.stringify(rawState)]);
+  const byMsid = msid
+    ? await db.query('SELECT id FROM student_sessions WHERE platform_session_id = $1 LIMIT 1', [msid])
+    : { rows: [] };
 
-  return {
-    sessionId: sessionResult.rows[0].id,
-    rawState,
-  };
+  let sessionId: string;
+  if (byMsid.rows[0]) {
+    await db.query(
+      'UPDATE student_sessions SET raw_state = $1, jwt_token = $2, fetched_at = NOW() WHERE id = $3',
+      [JSON.stringify(rawState), jwtToken, byMsid.rows[0].id]
+    );
+    sessionId = byMsid.rows[0].id;
+  } else {
+    const byPair = await db.query(
+      `SELECT id FROM student_sessions
+       WHERE student_id = $1 AND control_sheet_id = $2
+       ORDER BY fetched_at DESC LIMIT 1`,
+      [studentId, controlSheetId]
+    );
+    if (byPair.rows[0]) {
+      await db.query(
+        'UPDATE student_sessions SET platform_session_id = $1, jwt_token = $2, raw_state = $3, fetched_at = NOW() WHERE id = $4',
+        [msid, jwtToken, JSON.stringify(rawState), byPair.rows[0].id]
+      );
+      sessionId = byPair.rows[0].id;
+    } else {
+      const ins = await db.query(`
+        INSERT INTO student_sessions (platform_session_id, jwt_token, jwt_expires_at, control_sheet_id, student_id, teacher_id, raw_state, fetched_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING id
+      `, [msid, jwtToken, expires, controlSheetId, studentId, teacherId, JSON.stringify(rawState)]);
+      sessionId = ins.rows[0].id;
+    }
+  }
+
+  return { sessionId, rawState };
 }

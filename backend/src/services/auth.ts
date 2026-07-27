@@ -9,7 +9,7 @@ const JWT_SECRET: string = (() => {
   if (!s) throw new Error('JWT_SECRET env var is required but not set');
   return s;
 })();
-const SESSION_TTL = 24 * 60 * 60; // 24 hours in seconds
+const SESSION_TTL = 7 * 24 * 60 * 60; // 7 days
 
 export interface TeacherSession {
   teacherId: string;
@@ -56,9 +56,9 @@ export async function loginWithCredentials(email: string, password: string): Pro
   const teacher = result.rows[0];
 
   const sessionToken = jwt.sign(
-    { teacherId: teacher.id, platformUserId: teacher.platform_user_id },
+    { teacherId: teacher.id, platformUserId: teacher.platform_user_id, jti: teacher.id + Date.now() },
     JWT_SECRET,
-    { expiresIn: SESSION_TTL }
+    { expiresIn: SESSION_TTL },
   );
 
   return {
@@ -104,6 +104,45 @@ export async function getDecryptedToken(teacherId: string): Promise<string | nul
   }
 
   return decrypt(encrypted_login_token);
+}
+
+/** Issues a fresh session JWT (e.g., for refresh endpoint) without re-authenticating with platform. */
+export function issueSessionToken(teacherId: string, platformUserId: string): string {
+  return jwt.sign(
+    { teacherId, platformUserId, jti: teacherId + Date.now() },
+    JWT_SECRET,
+    { expiresIn: SESSION_TTL },
+  );
+}
+
+/**
+ * Attempts to refresh the teacher's platform (Gena) login token using { resume }.
+ * Updates the DB with the new token and expiry.
+ * Returns true if refresh succeeded.
+ */
+export async function refreshPlatformToken(teacherId: string): Promise<boolean> {
+  const current = await getDecryptedToken(teacherId);
+  if (!current) return false;
+
+  try {
+    const { loginTeacher: genaResume } = await import('../ddp/gena-client');
+    // Use resume flow — doesn't require password
+    const { getGenaClient } = await import('../ddp/gena-client');
+    const c = getGenaClient();
+    if (!c.connected) return false;
+    const result = await c.call('login', { resume: current });
+    const newToken: string = result.token;
+    const newExpires: Date = new Date(result.tokenExpires);
+    const encrypted = encrypt(newToken);
+    await db.query(
+      `UPDATE teachers SET encrypted_login_token = $1, token_expires_at = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [encrypted, newExpires, teacherId],
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function getDecryptedEdikToken(teacherId: string): Promise<string | null> {

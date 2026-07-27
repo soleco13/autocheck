@@ -245,7 +245,7 @@ export default function StudentCard() {
               style={{ background: 'var(--c-danger)', color: '#fff', border: 'none', gap: 5 }}
             >
               <Square size={12} />
-              Остановить ({bulkProgress?.done ?? 0}/{bulkProgress?.total ?? 0})
+              Остановить ({Math.floor(bulkProgress?.done ?? 0)}/{bulkProgress?.total ?? 0})
             </button>
           )}
 

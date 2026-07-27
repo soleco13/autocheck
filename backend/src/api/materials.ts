@@ -4,6 +4,7 @@ import { safeError } from '../lib/safe-error';
 import { getDecryptedToken } from '../services/auth';
 import { callGena, getChildsMaterials, getNewMaterialsMap } from '../ddp/gena-client';
 import { db } from '../db';
+import { cacheGet, cacheSet } from '../lib/redis-cache';
 
 const router = Router();
 
@@ -13,6 +14,79 @@ function extractGradeFromBranchName(name: string): string | null {
   return null;
 }
 
+// Full materials catalog cached in Redis per teacher — 10 min TTL.
+// Pagination/filtering applied on cached data IN-PROCESS: zero DDP calls on page 2, 3, …
+// Catalog rarely changes (new lesson added = max once a day), so 10 min TTL is safe.
+const CATALOG_TTL_S = 10 * 60;
+
+interface CachedCatalog {
+  allMaterials: any[];
+  filters: { skills: any[]; grades: (string | null)[]; types: string[] };
+}
+
+async function fetchMaterialsCatalog(loginToken: string, teacherId: string): Promise<CachedCatalog | null> {
+  const redisKey = `materials-catalog:${teacherId}`;
+
+  // Cache hit — serve instantly (covers all subsequent paginated requests)
+  const hit = await cacheGet<CachedCatalog>(redisKey);
+  if (hit) return hit;
+
+  // Cache miss — call Gena once, build full catalog, store in Redis
+  const [branchesResult, skillsResult] = await Promise.all([
+    callGena(loginToken, 'api.materials.getAllBranchesWithMaterialsBySkills', {}),
+    callGena(loginToken, 'api.skills.getSkills', {}),
+  ]);
+
+  const skillMap: Record<string, string> = {};
+  if (skillsResult && typeof skillsResult === 'object') {
+    for (const [skillId, skillData] of Object.entries(skillsResult as Record<string, any>)) {
+      const ru = (skillData as any)?.ru;
+      if (ru?.title) skillMap[skillId] = ru.title;
+    }
+  }
+
+  const allMaterials: any[] = [];
+  if (Array.isArray(branchesResult)) {
+    for (const branch of branchesResult) {
+      const branchId = branch.id;
+      const branchName: string = branch.name || '';
+      const skillId: string = branch.skillId || '';
+      const skillName = skillMap[skillId] || skillId;
+      const grade = extractGradeFromBranchName(branchName);
+      if (!Array.isArray(branch.materials)) continue;
+      for (const mat of branch.materials) {
+        allMaterials.push({
+          _id: mat._id,
+          title: mat.title || '',
+          skillId, skillName, branchId, branchName, grade,
+          type: mat.type || 'interactive',
+          materialLink: mat.materialLink || null,
+          lang: mat.lang || 'ru',
+          tags: mat.tags || [],
+        });
+      }
+    }
+  }
+
+  if (allMaterials.length === 0) return null; // don't cache empty result
+
+  const filters = {
+    skills: Array.from(
+      new Map(allMaterials.map(m => [m.skillId, { skillId: m.skillId, skillName: m.skillName }])).values(),
+    ),
+    grades: Array.from(new Set(allMaterials.map(m => m.grade).filter(Boolean))).sort(
+      (a, b) => parseInt(a!) - parseInt(b!),
+    ),
+    types: Array.from(new Set(allMaterials.map(m => m.type).filter(Boolean))),
+  };
+
+  const catalog: CachedCatalog = { allMaterials, filters };
+  await cacheSet(redisKey, catalog, CATALOG_TTL_S);
+  return catalog;
+}
+
+// GET /api/materials — full catalog with server-side pagination/filtering.
+// Gena is called AT MOST ONCE per teacher per 10 minutes, regardless of page count.
 router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const loginToken = await getDecryptedToken(req.teacherId!);
@@ -21,92 +95,63 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
       return;
     }
 
-    const [branchesResult, skillsResult] = await Promise.all([
-      callGena(loginToken, 'api.materials.getAllBranchesWithMaterialsBySkills', {}),
-      callGena(loginToken, 'api.skills.getSkills', {}),
-    ]);
-
-    const skillMap: Record<string, string> = {};
-    if (skillsResult && typeof skillsResult === 'object') {
-      for (const [skillId, skillData] of Object.entries(skillsResult as Record<string, any>)) {
-        const ru = (skillData as any)?.ru;
-        if (ru?.title) {
-          skillMap[skillId] = ru.title;
-        }
-      }
+    const forceRefresh = req.query.refresh === 'true';
+    if (forceRefresh) {
+      // Invalidate cache so next call fetches fresh data
+      const { cacheDel } = await import('../lib/redis-cache');
+      await cacheDel(`materials-catalog:${req.teacherId}`);
     }
 
-    const page = parseInt(String(req.query.page || '1'), 10);
-    const pageSize = parseInt(String(req.query.pageSize || '20'), 10);
-    const filterGrade = req.query.grade ? String(req.query.grade) : null;
-    const filterSkill = req.query.skillId ? String(req.query.skillId) : null;
-    const filterType = req.query.type ? String(req.query.type) : null;
-    const filterSearch = req.query.search ? String(req.query.search).trim().toLowerCase() : null;
+    const catalog = await fetchMaterialsCatalog(loginToken, req.teacherId!);
 
-    const allMaterials: any[] = [];
-
-    if (Array.isArray(branchesResult)) {
-      for (const branch of branchesResult) {
-        const branchId = branch.id;
-        const branchName: string = branch.name || '';
-        const skillId: string = branch.skillId || '';
-        const skillName = skillMap[skillId] || skillId;
-        const grade = extractGradeFromBranchName(branchName);
-
-        if (!Array.isArray(branch.materials)) continue;
-
-        for (const mat of branch.materials) {
-          allMaterials.push({
-            _id: mat._id,
-            title: mat.title || '',
-            skillId,
-            skillName,
-            branchId,
-            branchName,
-            grade,
-            type: mat.type || 'interactive',
-            materialLink: mat.materialLink || null,
-            lang: mat.lang || 'ru',
-            tags: mat.tags || [],
-          });
-        }
-      }
+    if (!catalog) {
+      // Gena returned empty — could be circuit open or no data
+      res.json({ materials: [], pagination: { page: 1, pageSize: 20, total: 0, totalPages: 0 }, filters: { skills: [], grades: [], types: [] } });
+      return;
     }
+
+    const { allMaterials, filters } = catalog;
+
+    const page       = Math.max(1, parseInt(String(req.query.page || '1'), 10));
+    const pageSize   = Math.min(100, Math.max(1, parseInt(String(req.query.pageSize || '20'), 10)));
+    const filterGrade  = req.query.grade   ? String(req.query.grade)  : null;
+    const filterSkill  = req.query.skillId ? String(req.query.skillId) : null;
+    const filterType   = req.query.type    ? String(req.query.type)    : null;
+    const filterSearch = req.query.search  ? String(req.query.search).trim().toLowerCase() : null;
 
     let filtered = allMaterials;
-    if (filterGrade) {
-      filtered = filtered.filter(m => m.grade === filterGrade);
-    }
-    if (filterSkill) {
-      filtered = filtered.filter(m => m.skillId === filterSkill);
-    }
-    if (filterType) {
-      filtered = filtered.filter(m => m.type === filterType);
-    }
-    if (filterSearch) {
-      filtered = filtered.filter(m => m.title.toLowerCase().includes(filterSearch));
-    }
+    if (filterGrade)  filtered = filtered.filter(m => m.grade === filterGrade);
+    if (filterSkill)  filtered = filtered.filter(m => m.skillId === filterSkill);
+    if (filterType)   filtered = filtered.filter(m => m.type === filterType);
+    if (filterSearch) filtered = filtered.filter(m => m.title.toLowerCase().includes(filterSearch));
 
-    const total = filtered.length;
-    const totalPages = Math.ceil(total / pageSize);
-    const offset = (page - 1) * pageSize;
-    const paginated = filtered.slice(offset, offset + pageSize);
-
-    const uniqueSkills = Array.from(
-      new Map(allMaterials.map(m => [m.skillId, { skillId: m.skillId, skillName: m.skillName }])).values()
-    );
-    const uniqueGrades = Array.from(new Set(allMaterials.map(m => m.grade).filter(Boolean))).sort(
-      (a, b) => parseInt(a!) - parseInt(b!)
-    );
-    const uniqueTypes = Array.from(new Set(allMaterials.map(m => m.type).filter(Boolean)));
+    const total      = filtered.length;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const offset     = (page - 1) * pageSize;
 
     res.json({
-      materials: paginated,
+      materials: filtered.slice(offset, offset + pageSize),
       pagination: { page, pageSize, total, totalPages },
-      filters: { skills: uniqueSkills, grades: uniqueGrades, types: uniqueTypes },
+      filters,
     });
   } catch (err: any) {
     console.error('[materials] GET / error:', err.message);
+    // Any platform error (circuit open, auth failed, timeout) → 503 with empty list.
+    // This prevents cascading 500 errors when Gena is unavailable.
+    const isPlatformErr = err.message?.includes('CIRCUIT_OPEN')
+      || err.message?.includes('недоступна')
+      || err.message?.includes('DDP auth')
+      || err.message?.includes('Auth failed')
+      || err.message?.includes('PLATFORM_TIMEOUT')
+      || err.message?.includes('платформ');
+    if (isPlatformErr) {
+      res.status(503).json({
+        error: 'Платформа временно недоступна. Материалы загрузятся автоматически.',
+        materials: [], pagination: { page: 1, pageSize: 20, total: 0, totalPages: 0 },
+        filters: { skills: [], grades: [], types: [] },
+      });
+      return;
+    }
     res.status(500).json({ error: safeError(err) });
   }
 });
@@ -129,12 +174,47 @@ function buildCheckedList(rows: any[]): any[] {
   }));
 }
 
+// Redis cache key for teacher's student assignments (all materials at once)
+const ASSIGNMENTS_TTL_S = 120; // 2 minutes
+
+// Fetch assignments for all students in PARALLEL batches of 30.
+// Old: 10 batches × 4s SEQUENTIAL = 40s
+// New: 10 batches × 4s PARALLEL   = ~4s (bounded by genaGuard maxConcurrent=8)
+// The batch size of 30 is preserved because the platform rejects larger arrays.
+async function fetchAllStudentAssignments(
+  loginToken: string,
+  allPlatformIds: string[],
+): Promise<any[]> {
+  if (allPlatformIds.length === 0) return [];
+
+  const BATCH = 30;
+  const batches: string[][] = [];
+  for (let i = 0; i < allPlatformIds.length; i += BATCH) {
+    batches.push(allPlatformIds.slice(i, i + BATCH));
+  }
+
+  const results = await Promise.allSettled(
+    batches.map(chunk =>
+      callGena(loginToken, 'api.materials.getChildsMaterials', { childsIds: chunk }),
+    ),
+  );
+
+  const combined: any[] = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+      combined.push(...r.value);
+    }
+  }
+  return combined;
+}
+
 // GET /:materialId/students?dbOnly=true  → instant DB-only response
-// GET /:materialId/students              → full response incl. slow platform fetch
+// GET /:materialId/students              → full response incl. platform fetch (cached 2 min)
 router.get('/:materialId/students', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { materialId } = req.params;
     const dbOnly = req.query.dbOnly === 'true';
+    const forceRefresh = req.query.refresh === 'true';
 
     // ── Phase 1: DB-checked sessions (always instant) ──────────────────
     const checkedResult = await db.query(`
@@ -153,7 +233,6 @@ router.get('/:materialId/students', requireAuth, async (req: AuthRequest, res: R
     const checkedList = buildCheckedList(checkedResult.rows);
     const checkedStudentIds = new Set(checkedResult.rows.map((r: any) => r.platform_student_id));
 
-    // Return immediately if dbOnly requested
     if (dbOnly) {
       return res.json({
         students: checkedList,
@@ -163,13 +242,11 @@ router.get('/:materialId/students', requireAuth, async (req: AuthRequest, res: R
       });
     }
 
-    // ── Phase 2: Platform fetch (slow DDP) ─────────────────────────────
+    // ── Phase 2: Platform fetch (cached) ───────────────────────────────
     const loginToken = await getDecryptedToken(req.teacherId!);
     if (!loginToken) {
       return res.json({
-        students: checkedList,
-        platformStudents: [],
-        platformLoading: false,
+        students: checkedList, platformStudents: [], platformLoading: false,
         platformError: 'Login token expired',
         counts: { pending: 0, checked: checkedList.length, total: checkedList.length },
       });
@@ -184,41 +261,45 @@ router.get('/:materialId/students', requireAuth, async (req: AuthRequest, res: R
 
     const allStudents = allStudentsResult.rows;
     const studentByPid = new Map(allStudents.map((s: any) => [s.platform_student_id, s]));
-    const platformResults: any[] = [];
-
-    const BATCH = 30;
     const uncheckedStudents = allStudents.filter((s: any) => !checkedStudentIds.has(s.platform_student_id));
-    const TOTAL_TIMEOUT = 45000;
-    const startTime = Date.now();
 
-    for (let i = 0; i < uncheckedStudents.length; i += BATCH) {
-      if (Date.now() - startTime > TOTAL_TIMEOUT) break;
-      const batch = uncheckedStudents.slice(i, i + BATCH);
-      const childsIds = batch.map((s: any) => s.platform_student_id);
-      try {
-        const result = await callGena(loginToken, 'api.materials.getChildsMaterials', { childsIds });
-        if (!Array.isArray(result)) continue;
-        for (const studentData of result) {
-          const assignment = (studentData.materials || []).find((m: any) => m.materialId === materialId);
-          if (!assignment) continue;
-          const s = studentByPid.get(studentData._id);
-          if (!s || checkedStudentIds.has(studentData._id)) continue;
-          const activityEvents: any[] = assignment.activity || [];
-          const lastActivity = activityEvents[activityEvents.length - 1]?.ts || null;
-          platformResults.push({
-            studentId: s.id,
-            platformStudentId: studentData._id,
-            fullName: s.full_name,
-            grade: s.grade,
-            status: assignment.status || 'done',
-            lastActivity,
-            trainerToken: assignment.interactiveData?.trainerToken || null,
-            reportId: null,
-            sessionId: null,
-            source: 'platform',
-          });
-        }
-      } catch { /* skip failed batch */ }
+    // Redis cache — shared across all processes, survives restarts
+    const redisKey = `assignments:${req.teacherId}`;
+    let rawAssignments: any[] = [];
+
+    if (!forceRefresh) {
+      rawAssignments = (await cacheGet<any[]>(redisKey)) ?? [];
+    }
+
+    if (rawAssignments.length === 0) {
+      const allPlatformIds = uncheckedStudents.map((s: any) => s.platform_student_id);
+      rawAssignments = await fetchAllStudentAssignments(loginToken, allPlatformIds);
+      if (rawAssignments.length > 0) {
+        await cacheSet(redisKey, rawAssignments, ASSIGNMENTS_TTL_S);
+      }
+    }
+
+    // Filter for this specific materialId
+    const platformResults: any[] = [];
+    for (const studentData of rawAssignments) {
+      const assignment = (studentData.materials || []).find((m: any) => m.materialId === materialId);
+      if (!assignment) continue;
+      const s = studentByPid.get(studentData._id);
+      if (!s || checkedStudentIds.has(studentData._id)) continue;
+      const activityEvents: any[] = assignment.activity || [];
+      const lastActivity = activityEvents[activityEvents.length - 1]?.ts || null;
+      platformResults.push({
+        studentId: s.id,
+        platformStudentId: studentData._id,
+        fullName: s.full_name,
+        grade: s.grade,
+        status: assignment.status || 'done',
+        lastActivity,
+        trainerToken: assignment.interactiveData?.trainerToken || null,
+        reportId: null,
+        sessionId: null,
+        source: 'platform',
+      });
     }
 
     platformResults.sort((a, b) => {
@@ -227,7 +308,6 @@ router.get('/:materialId/students', requireAuth, async (req: AuthRequest, res: R
     });
 
     const allResults = [...platformResults, ...checkedList];
-
     res.json({
       students: allResults,
       platformStudents: platformResults,

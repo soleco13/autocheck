@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { getMe } from './api/client'
+import { useEffect } from 'react'
+import { getMe, refreshSession } from './api/client'
 import Login from './pages/Login'
 import Home from './pages/Home'
 import Dashboard from './pages/Dashboard'
@@ -12,10 +13,23 @@ import MaterialDetail from './pages/MaterialDetail'
 import History from './pages/History'
 import Settings from './pages/Settings'
 import Help from './pages/Help'
+import ErrorPage from './pages/ErrorPage'
 import Layout from './components/Layout'
 import { ToastProvider } from './components/Toast'
 import { Skeleton } from './components/Skeleton'
 import { CheckProvider } from './context/CheckContext'
+
+function SessionRefresher() {
+  useEffect(() => {
+    // Proactively refresh the JWT every 6 days (TTL is 7 days).
+    // Keeps active teachers logged in without manual re-login.
+    const interval = setInterval(() => {
+      refreshSession().catch(() => {}) // silent — 401 handled by axios interceptor
+    }, 6 * 24 * 60 * 60 * 1000)
+    return () => clearInterval(interval)
+  }, [])
+  return null
+}
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const { data, isLoading, isError } = useQuery({
@@ -51,6 +65,7 @@ export default function App() {
   return (
     <BrowserRouter>
       <ToastProvider />
+      <SessionRefresher />
       <CheckProvider>
       <Routes>
         <Route path="/login" element={<Login />} />
@@ -72,8 +87,13 @@ export default function App() {
           <Route path="history" element={<History />} />
           <Route path="settings" element={<Settings />} />
           <Route path="help" element={<Help />} />
+          <Route path="*" element={<ErrorPage code={404} />} />
         </Route>
-        <Route path="*" element={<Navigate to="/" replace />} />
+        {/* Standalone error pages (no auth required, e.g. backend redirect) */}
+        <Route path="/403" element={<ErrorPage code={403} />} />
+        <Route path="/429" element={<ErrorPage code={429} />} />
+        <Route path="/500" element={<ErrorPage code={500} />} />
+        <Route path="/503" element={<ErrorPage code={503} />} />
       </Routes>
       </CheckProvider>
     </BrowserRouter>

@@ -118,7 +118,7 @@ export default function Home() {
       </div>
 
       {/* Stat cards */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 18, marginBottom: 18 }}>
+      <div className="grid-4" style={{ marginBottom: 18 }}>
         <StatCard loading={loading} icon={<Users size={22} />} iconBg="#eff4ff" iconColor="#1d4ed8"
           label="Учеников всего" value={totalStudents} sub="по всем направлениям" trend={{ up: true, value: '+3' }} />
         <StatCard loading={loading} icon={<CheckCircle size={22} />} iconBg="#f0fdf4" iconColor="#16a34a"

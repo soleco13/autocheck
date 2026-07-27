@@ -19,6 +19,10 @@ for (const key of REQUIRED_ENV) {
     process.exit(1);
   }
 }
+if (!process.env.NODE_ENV) {
+  process.env.NODE_ENV = 'production';
+  console.warn('⚠️  NODE_ENV not set — defaulted to production');
+}
 
 import { logger } from './lib/logger';
 
@@ -45,6 +49,8 @@ import textbooksRouter from './api/textbooks';
 import materialsRouter from './api/materials';
 import debugRouter from './api/debug';
 import settingsRouter from './api/settings';
+import eventsRouter from './api/events';
+import platformRouter from './api/platform';
 import { requireAuth } from './middleware/auth-middleware';
 
 const app = express();
@@ -77,7 +83,14 @@ app.use(helmet({
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 
 // ── Compression ──────────────────────────────────────────────────────────────
-app.use(compression());
+// Skip SSE connections: compression buffers chunks until flush, which prevents
+// server-sent events from being streamed to the client in real time.
+app.use(compression({
+  filter: (req, res) => {
+    if (req.headers.accept?.includes('text/event-stream')) return false;
+    return compression.filter(req, res);
+  },
+}));
 
 // ── HTTP request logging ─────────────────────────────────────────────────────
 app.use(pinoHttp({
@@ -89,6 +102,7 @@ app.use(pinoHttp({
 }));
 
 // ── Request timeouts ─────────────────────────────────────────────────────────
+app.use('/api/textbooks/upload-pdf', timeout('180s')); // PDF parsing может занять до 2 мин
 app.use('/api/students/:id/works', timeout('90s'));
 app.use('/api/checks', timeout('90s'));
 app.use(timeout('60s'));
@@ -107,8 +121,14 @@ const loginLimiter = rateLimit({
   message: { error: 'Слишком много попыток входа. Попробуйте через 15 минут.' },
   standardHeaders: true, legacyHeaders: false,
 });
+
+// Per-teacher rate limit (keyed by teacherId after auth, falls back to IP).
+// 600/min per teacher allows bulk polling without hitting the wall:
+// 10 teachers × 20 polls/min = 200/teacher — well within limit.
+// IP-keyed fallback handles unauthenticated endpoints (/health, /auth/login).
 const apiLimiter = rateLimit({
-  windowMs: 60_000, max: 300,
+  windowMs: 60_000, max: 600,
+  keyGenerator: (req) => (req as any).teacherId || req.ip || 'unknown',
   message: { error: 'Слишком много запросов. Подождите минуту.' },
   standardHeaders: true, legacyHeaders: false,
   skip: (req) => req.path === '/health',
@@ -126,13 +146,53 @@ if (!IS_PROD) {
 app.use('/api/auth', authRouter);
 app.use('/api/students', studentsRouter);
 app.use('/api/checks', checksRouter);
+app.use('/api/events', eventsRouter);
 app.use('/api/reports', reportsRouter);
 app.use('/api/textbooks', textbooksRouter);
 app.use('/api/materials', materialsRouter);
 app.use('/api/settings', settingsRouter);
+app.use('/api/platform', platformRouter);
 
-// ── Deep health check ────────────────────────────────────────────────────────
-app.get('/api/health', async (_req, res) => {
+// ── Bull Board — queue/worker monitoring UI ──────────────────────────────────
+// Mounted at /queues — accessible only to authenticated teachers.
+// Lazy-loaded so it doesn't error on startup if Redis is unavailable.
+{
+  const BULL_BOARD_PATH = '/queues';
+  app.use(BULL_BOARD_PATH, requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { createBullBoard } = await import('@bull-board/api');
+      const { BullMQAdapter }   = await import('@bull-board/api/bullMQAdapter');
+      const { ExpressAdapter }  = await import('@bull-board/express');
+      const { getCheckQueue, getTextbookQueue, isRedisQueueCapable } = await import('./queue');
+
+      if (!await isRedisQueueCapable()) {
+        res.status(503).send('<h2>Bull Board недоступен — Redis не подключён (inline-режим)</h2>');
+        return;
+      }
+
+      // Build the board once, cache it on app.locals to avoid re-creating on every request.
+      if (!app.locals._bullBoardRouter) {
+        const serverAdapter = new ExpressAdapter();
+        serverAdapter.setBasePath(BULL_BOARD_PATH);
+        createBullBoard({
+          queues: [new BullMQAdapter(getCheckQueue()), new BullMQAdapter(getTextbookQueue())],
+          serverAdapter,
+        });
+        app.locals._bullBoardRouter = serverAdapter.getRouter();
+      }
+
+      app.locals._bullBoardRouter(req, res, next);
+    } catch (err: any) {
+      next(err);
+    }
+  });
+}
+
+// ── Deep health check (cached 5 s to avoid DB/Redis I/O on every monitoring poll) ─
+let _healthCache: { result: object; status: number; ts: number } | null = null;
+const HEALTH_TTL_MS = 5_000;
+
+async function buildHealthPayload(): Promise<{ checks: Record<string, string>; coreHealthy: boolean; platformHealthy: boolean }> {
   const checks: Record<string, string> = {};
   try { const { db } = await import('./db'); await db.query('SELECT 1'); checks.postgres = 'ok'; }
   catch { checks.postgres = 'error'; }
@@ -143,7 +203,7 @@ app.get('/api/health', async (_req, res) => {
   try { const { getEdikClient } = await import('./ddp/edik-client'); checks.ddp_edik = getEdikClient()?.connected ? 'ok' : 'disconnected'; }
   catch { checks.ddp_edik = 'error'; }
 
-  // Platform guard circuit state
+  // Platform guard circuit state — advisory only, does not affect HTTP status code.
   try {
     const { genaGuard, edikGuard } = await import('./lib/platform-guard');
     const gs = genaGuard.status(); const es = edikGuard.status();
@@ -153,8 +213,41 @@ app.get('/api/health', async (_req, res) => {
     checks.edik_inflight = String(es.concurrent);
   } catch { /* ignore */ }
 
-  const healthy = ['postgres','redis','gena_circuit','edik_circuit'].every(k => !checks[k] || checks[k] === 'ok');
-  res.status(healthy ? 200 : 503).json({ status: healthy ? 'ok' : 'degraded', timestamp: new Date().toISOString(), checks });
+  // BullMQ queue stats
+  try {
+    const { getCheckQueue, isRedisQueueCapable } = await import('./queue');
+    if (await isRedisQueueCapable()) {
+      const q = getCheckQueue();
+      const [waiting, active, failed] = await Promise.all([
+        q.getWaitingCount(), q.getActiveCount(), q.getFailedCount(),
+      ]);
+      checks.queue_waiting = String(waiting);
+      checks.queue_active  = String(active);
+      checks.queue_failed  = String(failed);
+    } else {
+      checks.queue = 'inline-mode';
+    }
+  } catch { checks.queue = 'error'; }
+
+  const coreHealthy = ['postgres', 'redis'].every(k => checks[k] === 'ok');
+  const platformHealthy = ['gena_circuit', 'edik_circuit'].every(k => !checks[k] || checks[k] === 'ok');
+  return { checks, coreHealthy, platformHealthy };
+}
+
+app.get('/api/health', async (_req, res) => {
+  const now = Date.now();
+  if (_healthCache && now - _healthCache.ts < HEALTH_TTL_MS) {
+    return res.status(_healthCache.status).json(_healthCache.result);
+  }
+  const { checks, coreHealthy, platformHealthy } = await buildHealthPayload();
+  const result = {
+    status: coreHealthy ? 'ok' : 'degraded',
+    platform_status: platformHealthy ? 'ok' : 'degraded',
+    timestamp: new Date().toISOString(),
+    checks,
+  };
+  _healthCache = { result, status: coreHealthy ? 200 : 503, ts: now };
+  res.status(_healthCache.status).json(result);
 });
 
 // ── Global error handler (must be last) ─────────────────────────────────────
@@ -180,16 +273,63 @@ async function start() {
     process.exit(1);
   }
 
-  // 3. DDP (non-blocking)
+  // 3. Load system config from DB (after migrations so table exists)
+  const { configStore } = await import('./lib/config-store');
+  await configStore.load();
+
+  // 3b. Stuck-job reaper — marks processing jobs that exceeded their timeout as failed.
+  // Prevents jobs hung on a crashed/timed-out platform call from blocking forever.
+  {
+    const { db: dbRef } = await import('./db');
+    const reaper = async () => {
+      try {
+        const timeoutMin = configStore.get('stuck_job_timeout_min');
+        const result = await dbRef.query(
+          `UPDATE check_jobs
+           SET status = 'failed',
+               error  = 'Задача зависла (timeout) и была автоматически отменена.',
+               updated_at = NOW()
+           WHERE status IN ('processing', 'queued')
+             AND updated_at < NOW() - ($1 || ' minutes')::interval
+           RETURNING id`,
+          [timeoutMin],
+        );
+        if (result.rows.length > 0) {
+          logger.warn(`[reaper] Marked ${result.rows.length} stuck job(s) as failed (timeout=${timeoutMin}m)`);
+        }
+      } catch (err: any) {
+        logger.warn({ err }, '[reaper] Stuck-job check failed');
+      }
+    };
+    // Run once on startup (catches jobs stuck from a previous crash), then every 5 min.
+    reaper();
+    setInterval(reaper, 5 * 60_000).unref();
+  }
+
+  // 4. DDP (non-blocking)
   initDDPConnections().catch(err => logger.warn({ err }, 'DDP not ready on startup (will retry on demand)'));
 
-  // 4. BullMQ worker (if Redis capable)
+  // 4a. Monti APM monitoring (non-blocking)
+  const { initMontiClient } = await import('./ddp/monti-client');
+  initMontiClient().catch(err => logger.warn({ err }, '[Monti] not ready on startup'));
+
+  // 4b. SSE pub/sub subscriber — receives job completion events from workers (even in separate processes)
+  const { startJobEventSubscriber } = await import('./lib/pubsub');
+  startJobEventSubscriber();
+  logger.info('✅ SSE job-event subscriber started');
+
+  // 4c. Scheduled DB cleanup (completed jobs, old logs)
+  const { scheduleCleanup } = await import('./lib/cleanup');
+  scheduleCleanup();
+
+  // 5. BullMQ workers (if Redis capable and INLINE_WORKER not disabled)
   const { isRedisQueueCapable } = await import('./queue');
   if (process.env.INLINE_WORKER !== 'false' && await isRedisQueueCapable()) {
     try {
-      const { startCheckWorker } = await import('./worker');
+      const { startCheckWorker, startTextbookWorker } = await import('./worker');
       startCheckWorker();
-      logger.info('✅ Check worker started (BullMQ)');
+      startTextbookWorker();
+      logger.info('✅ Check + Textbook workers started (BullMQ)');
     } catch (err: any) { logger.warn({ err }, 'Inline worker not started'); }
   } else {
     logger.info('ℹ️  Inline check processing (Redis < 5 or INLINE_WORKER=false)');

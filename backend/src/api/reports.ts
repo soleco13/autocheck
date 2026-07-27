@@ -3,6 +3,7 @@ import { requireAuth, AuthRequest } from '../middleware/auth-middleware';
 import { db } from '../db';
 import { z } from 'zod';
 import { safeError } from '../lib/safe-error';
+import { audit } from '../lib/audit';
 
 const router = Router();
 
@@ -56,36 +57,53 @@ router.get('/history', requireAuth, async (req: AuthRequest, res: Response) => {
   }
 });
 
-// GET /api/reports/:id
+// GET /api/reports/:id — single query with JSON aggregation (2→1 round-trip)
 router.get('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const reportResult = await db.query(`
-      SELECT r.id, r.session_id, r.total_score, r.max_score, r.percentage,
-             r.grade as report_grade, r.status, r.ai_summary_for_student, r.ai_summary_for_teacher,
-             r.generated_at, ss.fetched_at,
-             s.id as student_id, s.full_name as student_name,
-             cs.title, cs.topic, cs.grade, cs.subject_code
+    const result = await db.query(`
+      SELECT
+        r.id, r.session_id, r.total_score, r.max_score, r.percentage,
+        r.grade as report_grade, r.status, r.ai_summary_for_student, r.ai_summary_for_teacher,
+        r.generated_at, ss.fetched_at,
+        s.id as student_id, s.full_name as student_name,
+        cs.title, cs.topic, cs.grade, cs.subject_code,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'id',                     a.id,
+              'session_id',             a.session_id,
+              'task_id',                a.task_id,
+              'student_answer',         a.student_answer,
+              'student_answer_structured', a.student_answer_structured,
+              'score',                  a.score,
+              'status',                 a.status,
+              'ai_feedback',            a.ai_feedback,
+              'ai_teacher_note',        a.ai_teacher_note,
+              'teacher_override_score', a.teacher_override_score,
+              'teacher_override_at',    a.teacher_override_at,
+              'created_at',             a.created_at,
+              'question_text',          t.question_text,
+              'task_type',              t.task_type,
+              'task_max_score',         t.max_score,
+              'slide_num',              t.slide_num,
+              'task_reference_answer',  t.reference_answer,
+              'task_index',             t.task_index
+            ) ORDER BY t.task_index
+          ) FILTER (WHERE a.id IS NOT NULL),
+          '[]'::json
+        ) AS answers
       FROM reports r
       JOIN student_sessions ss ON ss.id = r.session_id
-      JOIN students s ON s.id = ss.student_id
-      JOIN control_sheets cs ON cs.id = ss.control_sheet_id
+      JOIN students s         ON s.id  = ss.student_id
+      JOIN control_sheets cs  ON cs.id = ss.control_sheet_id
+      LEFT JOIN answers a     ON a.session_id = r.session_id
+      LEFT JOIN tasks t       ON t.id = a.task_id
       WHERE r.id = $1 AND ss.teacher_id = $2
+      GROUP BY r.id, ss.fetched_at, s.id, cs.id
     `, [req.params.id, req.teacherId]);
 
-    if (!reportResult.rows[0]) { res.status(404).json({ error: 'Report not found' }); return; }
-
-    const report = reportResult.rows[0];
-
-    const answersResult = await db.query(`
-      SELECT a.*, t.question_text, t.task_type, t.max_score as task_max_score,
-             t.slide_num, t.reference_answer as task_reference_answer
-      FROM answers a
-      JOIN tasks t ON t.id = a.task_id
-      WHERE a.session_id = $1
-      ORDER BY t.task_index
-    `, [report.session_id]);
-
-    res.json({ ...report, answers: answersResult.rows });
+    if (!result.rows[0]) { res.status(404).json({ error: 'Report not found' }); return; }
+    res.json(result.rows[0]);
   } catch (err: any) {
     res.status(500).json({ error: safeError(err) });
   }
@@ -106,16 +124,21 @@ router.patch('/answers/:answerId/override', requireAuth, async (req: AuthRequest
   const { score, note } = parsed.data;
 
   try {
+    // Scoped to this teacher's students — prevents cross-teacher score tampering
     const result = await db.query(`
       UPDATE answers SET
         teacher_override_score = $1,
         ai_teacher_note        = COALESCE($2, ai_teacher_note),
         teacher_override_at    = NOW()
       WHERE id = $3
+        AND session_id IN (
+          SELECT id FROM student_sessions WHERE teacher_id = $4
+        )
       RETURNING *
-    `, [score, note ?? null, req.params.answerId]);
+    `, [score, note ?? null, req.params.answerId, req.teacherId]);
 
     if (!result.rows[0]) { res.status(404).json({ error: 'Answer not found' }); return; }
+    audit({ teacherId: req.teacherId!, action: 'score_override', entityType: 'answer', entityId: req.params.answerId, metadata: { score, note } });
     res.json(result.rows[0]);
   } catch (err: any) {
     res.status(500).json({ error: safeError(err) });

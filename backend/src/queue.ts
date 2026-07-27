@@ -1,7 +1,8 @@
 import { Queue, QueueOptions } from 'bullmq';
 import IORedis from 'ioredis';
 
-export const CHECK_QUEUE_NAME = 'check-answers';
+export const CHECK_QUEUE_NAME    = 'check-answers';
+export const TEXTBOOK_QUEUE_NAME = 'textbook-index';
 
 // Payload carried through Redis to the worker. The trainerToken (JWT) is needed to
 // fetch the session state; it lives only in the Redis job, not in Postgres.
@@ -37,15 +38,16 @@ export function getRedis(): IORedis {
 let redisCapable: boolean | null = null;
 export async function isRedisQueueCapable(): Promise<boolean> {
   if (redisCapable !== null) return redisCapable;
+  const probe = new IORedis(process.env.REDIS_URL || 'redis://localhost:6379', {
+    maxRetriesPerRequest: 1,
+    connectTimeout: 2000,
+    lazyConnect: true,
+    retryStrategy: () => null, // probe once, don't retry
+  });
+  probe.on('error', () => {});
   try {
-    const probe = new IORedis(process.env.REDIS_URL || 'redis://localhost:6379', {
-      maxRetriesPerRequest: 1,
-      connectTimeout: 2000,
-      lazyConnect: true,
-    });
     await probe.connect();
     const info = await probe.info('server');
-    await probe.quit();
     const m = info.match(/redis_version:(\d+)\.(\d+)\.(\d+)/);
     const major = m ? parseInt(m[1], 10) : 0;
     redisCapable = major >= 5;
@@ -55,6 +57,8 @@ export async function isRedisQueueCapable(): Promise<boolean> {
   } catch (err: any) {
     console.warn('[queue] Redis not reachable for queue:', err?.message || err);
     redisCapable = false;
+  } finally {
+    try { probe.disconnect(); } catch { /* ignore */ }
   }
   return redisCapable;
 }
@@ -64,8 +68,11 @@ export function getCheckQueue(): Queue<CheckJobData> {
     const opts: QueueOptions = {
       connection: getRedis() as any,
       defaultJobOptions: {
-        attempts: 2,
-        backoff: { type: 'exponential', delay: 3000 },
+        // 3 attempts total. Backoff delay is controlled per-error-type by the
+        // worker's custom backoffStrategy (see worker.ts). The 'exponential' type
+        // here is just the fallback base; the strategy function overrides it.
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 1_000 },
         removeOnComplete: 100,
         removeOnFail: 500,
       },
@@ -77,3 +84,28 @@ export function getCheckQueue(): Queue<CheckJobData> {
 
 // Priority: manual checks (teacher is waiting) jump ahead of background prefetch.
 export const PRIORITY = { manual: 1, prefetch: 10 } as const;
+
+// ── Textbook indexing queue ───────────────────────────────────────────────────
+
+export interface TextbookIndexJobData {
+  documentId: string;   // id в rag_documents
+  teacherId:  string;
+  filePath:   string;   // абсолютный путь к temp-файлу на диске
+}
+
+let textbookQueue: Queue<TextbookIndexJobData> | null = null;
+
+export function getTextbookQueue(): Queue<TextbookIndexJobData> {
+  if (!textbookQueue) {
+    textbookQueue = new Queue<TextbookIndexJobData>(TEXTBOOK_QUEUE_NAME, {
+      connection: getRedis() as any,
+      defaultJobOptions: {
+        attempts: 2,
+        backoff: { type: 'exponential', delay: 5_000 },
+        removeOnComplete: 50,
+        removeOnFail: 100,
+      },
+    });
+  }
+  return textbookQueue;
+}

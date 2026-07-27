@@ -1,4 +1,4 @@
-import { useState, useRef, useMemo } from 'react'
+import { useState, useRef, useMemo, useEffect } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -308,6 +308,159 @@ function GenericAns({ status, studentAnswer, reference }: { status: string; stud
   )
 }
 
+function SubAnswerRow({ ans, partNum, overrides, setScore }: {
+  ans: any; partNum: number
+  overrides: Record<string, number>; setScore: (id: string, s: number) => void
+}) {
+  const m = getR(ans.status)
+  const effectiveScore = overrides[ans.id] != null ? overrides[ans.id] : (ans.teacher_override_score ?? ans.score ?? 0)
+  const maxScore = ans.task_max_score || 1
+
+  return (
+    <div style={{ paddingTop: 12, paddingBottom: 12, borderBottom: '1px solid var(--c-border-solid)' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 11.5, fontWeight: 800, color: 'var(--c-text-3)', minWidth: 56 }}>
+          Ответ {partNum}
+        </span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12.5, fontWeight: 700, color: m.color }}>
+          {m.icon} {m.label}
+        </span>
+        {(overrides[ans.id] != null || ans.teacher_override_at) && (
+          <span style={{ fontSize: 11, color: '#b45309', display: 'inline-flex', alignItems: 'center', gap: 3 }}><Pencil size={10} /> скорр.</span>
+        )}
+        <span style={{ marginLeft: 'auto', flexShrink: 0, display: 'inline-flex', alignItems: 'baseline', gap: 1, background: m.hollow ? '#fff' : m.color, color: m.hollow ? '#c2410c' : '#fff', border: m.hollow ? `1.5px solid #fb923c` : 'none', padding: '3px 9px', borderRadius: 7, fontWeight: 800, fontSize: 13 }}>
+          <span>{effectiveScore}</span><span style={{ fontSize: 11, opacity: 0.85 }}>/{maxScore}</span>
+        </span>
+      </div>
+
+      {(ans.student_answer || ans.task_reference_answer) && (
+        <div style={{ marginBottom: 8, marginLeft: 60 }}>
+          <GenericAns status={ans.status} studentAnswer={ans.student_answer} reference={ans.task_reference_answer} />
+        </div>
+      )}
+
+      {ans.ai_feedback && (
+        <div style={{ marginLeft: 60, marginBottom: 8, display: 'flex', gap: 8, alignItems: 'flex-start', background: 'var(--c-surface-2)', border: '1px solid var(--c-border-solid)', borderRadius: 10, padding: '9px 11px' }}>
+          <span style={{ width: 22, height: 22, borderRadius: 6, background: 'var(--c-teal-light)', color: 'var(--c-teal)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+            <Sparkles size={12} />
+          </span>
+          <div>
+            <div style={{ fontSize: 10.5, fontWeight: 800, color: 'var(--c-teal)', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 2 }}>Комментарий ИИ</div>
+            <p style={{ fontSize: 13, color: 'var(--c-text-2)', lineHeight: 1.5, margin: 0 }}><MathText>{ans.ai_feedback}</MathText></p>
+          </div>
+        </div>
+      )}
+
+      {ans.ai_teacher_note && (
+        <div style={{ marginLeft: 60, marginBottom: 8, display: 'flex', gap: 8, alignItems: 'flex-start', background: '#fff7ed', border: '1px solid #fed7aa', borderRadius: 10, padding: '9px 11px' }}>
+          <span style={{ width: 22, height: 22, borderRadius: 6, background: '#ffedd5', color: '#ea580c', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+            <Eye size={12} />
+          </span>
+          <div>
+            <div style={{ fontSize: 10.5, fontWeight: 800, color: '#ea580c', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 2 }}>Нужна ручная проверка</div>
+            <p style={{ fontSize: 13, color: '#c2410c', lineHeight: 1.5, margin: 0 }}>{ans.ai_teacher_note}</p>
+          </div>
+        </div>
+      )}
+
+      <div style={{ marginLeft: 60, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 12, color: 'var(--c-text-2)', fontWeight: 650, display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+          <Pencil size={12} color="var(--c-text-3)" /> Выставить балл
+        </span>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {Array.from({ length: maxScore + 1 }, (_, i) => i).map(sc => (
+            <button key={sc} onClick={e => { e.stopPropagation(); setScore(ans.id, sc) }} style={{
+              minWidth: 30, height: 30, padding: '0 4px', borderRadius: 8, cursor: 'pointer', fontWeight: 750, fontSize: 13,
+              background: effectiveScore === sc ? 'var(--c-primary)' : 'var(--c-surface)',
+              color: effectiveScore === sc ? '#fff' : 'var(--c-text-2)',
+              border: `1px solid ${effectiveScore === sc ? 'var(--c-primary)' : 'var(--c-border-solid)'}`,
+              transition: 'all 0.14s',
+            }}>{sc}</button>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function CompoundTaskCard({ questionText, answers, globalStartIdx, expanded, onToggle, flash, overrides, setScore }: {
+  questionText: string; answers: any[]; globalStartIdx: number
+  expanded: boolean; onToggle: () => void; flash: boolean
+  overrides: Record<string, number>; setScore: (id: string, s: number) => void
+}) {
+  const STATUS_PRIORITY = ['manual_required', 'incorrect', 'partial', 'correct', 'pending', 'error']
+  const aggStatus = answers.reduce((best, ans) => {
+    return STATUS_PRIORITY.indexOf(ans.status) < STATUS_PRIORITY.indexOf(best) ? ans.status : best
+  }, 'correct')
+  const m = getR(aggStatus)
+  const totalScore = answers.reduce((sum, ans) => sum + (overrides[ans.id] != null ? overrides[ans.id] : (ans.teacher_override_score ?? ans.score ?? 0)), 0)
+  const totalMax = answers.reduce((sum, ans) => sum + (ans.task_max_score || 1), 0)
+  const hasOverride = answers.some(a => overrides[a.id] != null || a.teacher_override_at)
+  const taskTypes = [...new Set(answers.map((a: any) => a.task_type))].filter(Boolean)
+  const typeLabel = taskTypes.length === 1 ? (TYPE_LABEL[taskTypes[0]] || taskTypes[0]) : 'Открытый ответ'
+
+  return (
+    <div className={`task-card ${flash ? 'card-flash' : ''}`}
+      style={{ display: 'flex', background: 'var(--c-surface)', border: '1px solid var(--c-border-solid)', borderRadius: 14, overflow: 'hidden' }}>
+
+      <div onClick={onToggle} style={{
+        width: 52, flexShrink: 0, cursor: 'pointer', background: m.bg,
+        borderRight: `1px solid ${m.accent}33`,
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 5,
+      }}>
+        <span style={{
+          width: 30, height: 30, borderRadius: '50%', background: '#fff',
+          border: `1.5px solid ${m.accent}`, color: m.accent,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>{m.icon}</span>
+        <span style={{ fontSize: 10.5, fontWeight: 800, color: m.color, textAlign: 'center', lineHeight: 1.15 }}>
+          {globalStartIdx + 1}–{globalStartIdx + answers.length}
+        </span>
+      </div>
+
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div onClick={onToggle} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '13px 16px', cursor: 'pointer' }}>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 13.5, fontWeight: 750, color: m.color }}>{m.label}</span>
+              <span style={{ fontSize: 10.5, fontWeight: 700, color: 'var(--c-text-3)', background: 'var(--c-surface-3)', padding: '2px 8px', borderRadius: 6, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                {typeLabel}
+              </span>
+              <span style={{ fontSize: 11, color: 'var(--c-text-3)', background: 'var(--c-surface-3)', padding: '2px 7px', borderRadius: 6, fontWeight: 600 }}>
+                {answers.length} {plural(answers.length, 'ответ', 'ответа', 'ответов')}
+              </span>
+              {hasOverride && (
+                <span style={{ fontSize: 11, color: '#b45309', display: 'inline-flex', alignItems: 'center', gap: 3 }}><Pencil size={10} /> скорр.</span>
+              )}
+            </div>
+            {questionText && (
+              <div style={{ fontSize: 14.5, fontWeight: 600, color: 'var(--c-text)', lineHeight: 1.4, whiteSpace: expanded ? 'normal' : 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                <MathText>{questionText}</MathText>
+              </div>
+            )}
+          </div>
+          <span style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'baseline', gap: 1, background: m.hollow ? '#fff' : m.color, color: m.hollow ? '#c2410c' : '#fff', border: m.hollow ? '1.5px solid #fb923c' : 'none', padding: '5px 11px', borderRadius: 9, fontWeight: 800, boxShadow: m.hollow ? 'none' : `0 2px 7px ${m.accent}55` }}>
+            <span style={{ fontSize: 15 }}>{totalScore}</span><span style={{ fontSize: 12, opacity: 0.85 }}>/{totalMax}</span>
+          </span>
+          {expanded
+            ? <ChevronDown size={18} color="var(--c-text-3)" style={{ flexShrink: 0, transform: 'rotate(180deg)', transition: 'transform 0.25s' }} />
+            : <ChevronRight size={18} color="var(--c-text-3)" style={{ flexShrink: 0, transition: 'transform 0.25s' }} />}
+        </div>
+
+        <div className="collapser" style={{ gridTemplateRows: expanded ? '1fr' : '0fr' }}>
+          <div className="collapser-inner">
+            <div style={{ padding: '0 16px 8px' }}>
+              {answers.map((ans: any, i: number) => (
+                <SubAnswerRow key={ans.id} ans={ans} partNum={i + 1} overrides={overrides} setScore={setScore} />
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function Report() {
   const { sessionId } = useParams<{ sessionId: string }>()
   const navigate = useNavigate()
@@ -320,10 +473,23 @@ export default function Report() {
   const [flashId, setFlashId] = useState<string | null>(null)
   const refs = useRef<Record<string, HTMLElement | null>>({})
 
-  const { data: report, isLoading } = useQuery({
+  const [pollExpired, setPollExpired] = useState(false)
+
+  const { data: report, isLoading, isError, refetch } = useQuery({
     queryKey: ['report', sessionId],
     queryFn: () => getCheckReport(sessionId!),
+    retry: 0,
   })
+
+  // When the report doesn't exist yet (job still running), poll every 3 s.
+  // Stop after 5 minutes — at that point the stuck-job reaper will have already
+  // marked the job as failed, and the user needs to re-run the check manually.
+  useEffect(() => {
+    if (!isError || pollExpired) return
+    const interval = setInterval(() => refetch(), 3_000)
+    const expire = setTimeout(() => { setPollExpired(true); clearInterval(interval) }, 5 * 60_000)
+    return () => { clearInterval(interval); clearTimeout(expire) }
+  }, [isError, pollExpired, refetch])
 
   const answers: any[] = useMemo(() => report?.answers ?? [], [report])
 
@@ -376,11 +542,26 @@ export default function Report() {
   if (isLoading) return <ReportSkeleton />
 
   if (!report) {
+    // Waiting for job to finish — show animated state
+    if (isError && !pollExpired) {
+      return (
+        <div style={{ maxWidth: 1080, margin: '0 auto' }}>
+          <div className="card card-pad" style={{ textAlign: 'center', padding: '48px 28px' }}>
+            <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 20 }}>
+              <span className="spinner spinner-dark" style={{ width: 32, height: 32, borderWidth: 3 }} />
+            </div>
+            <p style={{ fontWeight: 700, fontSize: 17, margin: '0 0 8px', color: 'var(--c-text)' }}>Проверка выполняется…</p>
+            <p style={{ color: 'var(--c-text-3)', fontSize: 14, margin: 0 }}>Отчёт появится автоматически, когда ИИ закончит проверку.<br />Не закрывайте страницу.</p>
+          </div>
+        </div>
+      )
+    }
     return (
       <div style={{ maxWidth: 1080, margin: '0 auto' }}>
         <div className="card empty-state">
           <div className="empty-state-icon"><Filter size={36} /></div>
           <p style={{ fontWeight: 600, margin: '0 0 6px' }}>Отчёт не найден</p>
+          <p style={{ color: 'var(--c-text-3)', fontSize: 13, margin: 0 }}>Проверка не была завершена или была отменена. Запустите проверку заново.</p>
         </div>
       </div>
     )
@@ -604,24 +785,64 @@ export default function Report() {
                       <>
                         <span style={{ fontSize: 11, color: 'var(--c-text-3)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Слайд</span>
                         <span style={{ fontSize: 17, fontWeight: 800, color: 'var(--c-primary)', lineHeight: 1 }}>{slideNum}</span>
-                        <span style={{ fontSize: 12.5, color: 'var(--c-text-3)', paddingLeft: 8, borderLeft: '1px solid var(--c-border-solid)' }}>{items.length} {plural(items.length, 'задание', 'задания', 'заданий')}</span>
+                        <span style={{ fontSize: 12.5, color: 'var(--c-text-3)', paddingLeft: 8, borderLeft: '1px solid var(--c-border-solid)' }}>{(() => { const n = new Set(items.map((a: any) => a.question_text || `__solo_${a.id}`)).size; return `${n} ${plural(n, 'задание', 'задания', 'заданий')}` })()}</span>
                       </>
                     ) : (
-                      <span style={{ fontSize: 12, color: 'var(--c-text-3)', fontStyle: 'italic' }}>Без слайда · {items.length} {plural(items.length, 'задание', 'задания', 'заданий')}</span>
+                      <span style={{ fontSize: 12, color: 'var(--c-text-3)', fontStyle: 'italic' }}>{(() => { const n = new Set(items.map((a: any) => a.question_text || `__solo_${a.id}`)).size; return `Без слайда · ${n} ${plural(n, 'задание', 'задания', 'заданий')}` })()}</span>
                     )}
                   </div>
                   <div style={{ flex: 1, height: 1, background: 'var(--c-border-solid)' }} />
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                  {items.map((ans: any) => {
-                    const idx = gi++
-                    return (
-                      <div key={ans.id} ref={el => { refs.current[ans.id] = el }}>
-                        <TaskCard ans={ans} globalIdx={idx} expanded={expanded.has(ans.id)} onToggle={() => toggle(ans.id)}
-                          flash={flashId === ans.id} overrides={overrides} setScore={setScore} qc={qc} sessionId={sessionId!} />
-                      </div>
-                    )
-                  })}
+                  {(() => {
+                    const qGroups: { key: string; questionText: string; items: any[] }[] = []
+                    const qMap = new Map<string, number>()
+                    items.forEach((ans: any) => {
+                      const qt: string = ans.question_text || ''
+                      const groupKey = qt || `__solo_${ans.id}`
+                      if (!qMap.has(groupKey)) {
+                        qMap.set(groupKey, qGroups.length)
+                        qGroups.push({ key: groupKey, questionText: qt, items: [] })
+                      }
+                      qGroups[qMap.get(groupKey)!].items.push(ans)
+                    })
+                    return qGroups.map(({ key, questionText, items: gItems }) => {
+                      if (gItems.length === 1) {
+                        const idx = gi++
+                        const ans = gItems[0]
+                        return (
+                          <div key={ans.id} ref={el => { refs.current[ans.id] = el }}>
+                            <TaskCard ans={ans} globalIdx={idx} expanded={expanded.has(ans.id)} onToggle={() => toggle(ans.id)}
+                              flash={flashId === ans.id} overrides={overrides} setScore={setScore} qc={qc} sessionId={sessionId!} />
+                          </div>
+                        )
+                      }
+                      const startIdx = gi
+                      gi += gItems.length
+                      const isExpanded = gItems.some(a => expanded.has(a.id))
+                      const isFlash = gItems.some(a => flashId === a.id)
+                      return (
+                        <div key={key} ref={el => { gItems.forEach(a => { refs.current[a.id] = el }) }}>
+                          <CompoundTaskCard
+                            questionText={questionText}
+                            answers={gItems}
+                            globalStartIdx={startIdx}
+                            expanded={isExpanded}
+                            onToggle={() => setExpanded(s => {
+                              const n = new Set(s)
+                              const anyExp = gItems.some(a => s.has(a.id))
+                              if (anyExp) gItems.forEach(a => n.delete(a.id))
+                              else gItems.forEach(a => n.add(a.id))
+                              return n
+                            })}
+                            flash={isFlash}
+                            overrides={overrides}
+                            setScore={setScore}
+                          />
+                        </div>
+                      )
+                    })
+                  })()}
                 </div>
               </div>
             ))

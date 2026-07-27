@@ -1,104 +1,234 @@
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { COVERS_DIR } from '../services/rag-indexer';
 import { Router, Response } from 'express';
+import multer from 'multer';
+import rateLimit from 'express-rate-limit';
 import { requireAuth, AuthRequest } from '../middleware/auth-middleware';
 import { safeError } from '../lib/safe-error';
 import { db } from '../db';
-import { z } from 'zod';
+import { getTextbookQueue, isRedisQueueCapable } from '../queue';
+import { runIndexPipeline } from '../services/rag-indexer';
+import { logger } from '../lib/logger';
 
 const router = Router();
 
-router.get('/', requireAuth, async (_req: AuthRequest, res: Response) => {
+// ── multer: temp storage, 50 MB limit, PDF only ──────────────────────────────
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: os.tmpdir(),
+    filename: (_req, file, cb) => {
+      const unique = `tb_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      cb(null, unique + path.extname(file.originalname));
+    },
+  }),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype === 'application/pdf' || file.originalname.toLowerCase().endsWith('.pdf')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Только PDF файлы поддерживаются'));
+    }
+  },
+});
+
+// 5 загрузок в минуту на учителя
+const uploadLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 5,
+  keyGenerator: (req: any) => req.teacherId || req.ip,
+  message: { error: 'Слишком много загрузок. Подождите минуту.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// ── GET /api/textbooks ────────────────────────────────────────────────────────
+
+router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const result = await db.query(`
-      SELECT t.id, t.grade, t.subject_code, t.subject_name, t.title, t.author,
-             COUNT(tc.id) AS chunks_count
-      FROM textbooks t
-      LEFT JOIN textbook_chunks tc ON tc.textbook_id = t.id
-      GROUP BY t.id
-      ORDER BY t.grade, t.subject_name
-    `);
+    const result = await db.query(
+      `SELECT id, filename, title, author, subject_code, grade, lang,
+              file_size_bytes, chunk_count, status, progress_step, progress_pct,
+              error_msg, created_at, updated_at
+       FROM rag_documents
+       WHERE teacher_id = $1
+       ORDER BY created_at DESC`,
+      [req.teacherId],
+    );
     res.json(result.rows);
   } catch (err: any) {
     res.status(500).json({ error: safeError(err) });
   }
 });
 
-const createSchema = z.object({
-  grade:       z.number().int().min(1).max(11),
-  subjectCode: z.string().min(1).max(10),
-  subjectName: z.string().min(1).max(100),
-  title:       z.string().min(1).max(300),
-  author:      z.string().max(200).optional(),
-  publisher:   z.string().max(200).optional(),
-  year:        z.number().int().min(1900).max(2100).optional(),
+// ── GET /api/textbooks/:id/cover — первая страница PDF как обложка ───────────
+
+router.get('/:id/cover', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    // Убедимся что учебник принадлежит этому учителю
+    const check = await db.query(
+      `SELECT 1 FROM rag_documents WHERE id = $1 AND teacher_id = $2`,
+      [req.params.id, req.teacherId],
+    );
+    if (!check.rows[0]) { res.status(404).end(); return; }
+
+    const coverPath = path.join(COVERS_DIR, `${req.params.id}.pdf`);
+    if (!fs.existsSync(coverPath)) { res.status(404).end(); return; }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Cache-Control', 'public, max-age=604800'); // 7 дней
+    fs.createReadStream(coverPath).pipe(res);
+  } catch (err: any) {
+    res.status(500).end();
+  }
 });
 
-router.post('/', requireAuth, async (req: AuthRequest, res: Response) => {
-  const parsed = createSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid input' });
-    return;
-  }
-  const { grade, subjectCode, subjectName, title, author, publisher, year } = parsed.data;
+// ── GET /api/textbooks/:id/status ────────────────────────────────────────────
 
+router.get('/:id/status', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const result = await db.query(`
-      INSERT INTO textbooks (grade, subject_code, subject_name, title, author, publisher, year)
-      VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *
-    `, [grade, subjectCode, subjectName, title, author ?? null, publisher ?? null, year ?? null]);
-    res.status(201).json(result.rows[0]);
+    const result = await db.query(
+      `SELECT id, status, progress_step, progress_pct, chunk_count, error_msg, updated_at
+       FROM rag_documents
+       WHERE id = $1 AND teacher_id = $2`,
+      [req.params.id, req.teacherId],
+    );
+    if (!result.rows[0]) { res.status(404).json({ error: 'Учебник не найден' }); return; }
+    res.json(result.rows[0]);
   } catch (err: any) {
     res.status(500).json({ error: safeError(err) });
   }
 });
 
-const contentSchema = z.object({
-  sections: z.array(z.object({
-    title:    z.string().max(300).optional(),
-    content:  z.string().max(500_000),
-    position: z.number().int().min(0).optional(),
-  })).min(1).max(100),
-});
+// ── POST /api/textbooks/upload-pdf ───────────────────────────────────────────
 
-router.post('/:id/content', requireAuth, async (req: AuthRequest, res: Response) => {
-  const parsed = contentSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid input' });
-    return;
-  }
-  const { sections } = parsed.data;
-  const textbookId = req.params.id;
-
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    let totalChunks = 0;
-
-    for (const section of sections) {
-      const sectionResult = await client.query(`
-        INSERT INTO textbook_sections (textbook_id, title, content, position)
-        VALUES ($1, $2, $3, $4) RETURNING id
-      `, [textbookId, section.title || 'Section', section.content, section.position ?? 0]);
-
-      const sectionId = sectionResult.rows[0].id;
-      const content = section.content;
-      const chunkSize = 500;
-
-      for (let i = 0; i < content.length; i += chunkSize) {
-        await client.query(`
-          INSERT INTO textbook_chunks (textbook_id, section_id, chunk_text, chunk_index)
-          VALUES ($1, $2, $3, $4)
-        `, [textbookId, sectionId, content.slice(i, i + chunkSize), Math.floor(i / chunkSize)]);
-        totalChunks++;
-      }
+router.post(
+  '/upload-pdf',
+  requireAuth,
+  uploadLimiter,
+  upload.single('file'),
+  async (req: AuthRequest, res: Response) => {
+    const file = (req as AuthRequest & { file?: Express.Multer.File }).file;
+    if (!file) {
+      res.status(400).json({ error: 'Файл не прикреплён' });
+      return;
     }
 
-    await client.query('COMMIT');
-    res.json({ sections: sections.length, chunks_count: totalChunks });
+    const { title, author, subjectCode, grade, lang } = req.body;
+    if (!title?.trim()) {
+      res.status(400).json({ error: 'Название учебника обязательно' });
+      return;
+    }
+
+    try {
+      // Create document record
+      const insertResult = await db.query(
+        `INSERT INTO rag_documents
+           (teacher_id, filename, title, author, subject_code, grade, lang, file_size_bytes, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+         RETURNING id`,
+        [
+          req.teacherId,
+          file.originalname,
+          title.trim(),
+          author?.trim() || null,
+          subjectCode || null,
+          grade || null,
+          lang || 'ru',
+          file.size,
+        ],
+      );
+
+      const documentId: string = insertResult.rows[0].id;
+      const filePath = file.path;
+
+      // Try BullMQ queue first, fall back to async inline
+      const canQueue = await isRedisQueueCapable();
+
+      if (canQueue) {
+        const queue = getTextbookQueue();
+        await queue.add('index', { documentId, teacherId: req.teacherId!, filePath });
+        logger.info({ documentId }, '[textbooks] enqueued for indexing');
+      } else {
+        // Non-blocking fallback — setImmediate so response is sent first
+        setImmediate(() => {
+          runIndexPipeline(documentId, filePath).catch(err => {
+            logger.error({ documentId, err: err.message }, '[textbooks] inline indexing failed');
+          });
+        });
+        logger.info({ documentId }, '[textbooks] inline indexing (no Redis)');
+      }
+
+      res.status(201).json({ id: documentId, status: 'pending' });
+    } catch (err: any) {
+      res.status(500).json({ error: safeError(err) });
+    }
+  },
+);
+
+// ── POST /api/textbooks/:id/reindex — повторная обработка с новым PDF ────────
+
+router.post(
+  '/:id/reindex',
+  requireAuth,
+  upload.single('file'),
+  async (req: AuthRequest, res: Response) => {
+    const file = (req as AuthRequest & { file?: Express.Multer.File }).file;
+    if (!file) { res.status(400).json({ error: 'Файл не прикреплён' }); return; }
+
+    try {
+      const docResult = await db.query(
+        `UPDATE rag_documents
+         SET status = 'pending', progress_step = NULL, progress_pct = 0,
+             chunk_count = 0, error_msg = NULL, file_size_bytes = $1, updated_at = NOW()
+         WHERE id = $2 AND teacher_id = $3
+         RETURNING id`,
+        [file.size, req.params.id, req.teacherId],
+      );
+      if (!docResult.rows[0]) {
+        res.status(404).json({ error: 'Учебник не найден' }); return;
+      }
+
+      const documentId = req.params.id;
+      const filePath = file.path;
+      const canQueue = await isRedisQueueCapable();
+
+      if (canQueue) {
+        const queue = getTextbookQueue();
+        await queue.add('index', { documentId, teacherId: req.teacherId!, filePath }, { priority: 1 });
+      } else {
+        setImmediate(() => {
+          runIndexPipeline(documentId, filePath).catch(err => {
+            logger.error({ documentId, err: err.message }, '[textbooks] reindex failed');
+          });
+        });
+      }
+
+      res.json({ id: documentId, status: 'pending' });
+    } catch (err: any) {
+      res.status(500).json({ error: safeError(err) });
+    }
+  },
+);
+
+// ── DELETE /api/textbooks/:id ─────────────────────────────────────────────────
+
+router.delete('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await db.query(
+      `DELETE FROM rag_documents
+       WHERE id = $1 AND teacher_id = $2
+       RETURNING id`,
+      [req.params.id, req.teacherId],
+    );
+    if (!result.rows[0]) { res.status(404).json({ error: 'Учебник не найден' }); return; }
+    // Удаляем файл обложки
+    try { fs.unlinkSync(path.join(COVERS_DIR, `${req.params.id}.pdf`)); } catch { /* уже нет */ }
+    res.json({ ok: true });
   } catch (err: any) {
-    await client.query('ROLLBACK');
     res.status(500).json({ error: safeError(err) });
-  } finally {
-    client.release();
   }
 });
 

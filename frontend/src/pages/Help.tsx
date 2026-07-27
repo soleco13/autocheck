@@ -96,7 +96,7 @@ export default function Help() {
       </div>
 
       {/* Steps */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 22 }}>
+      <div className="grid-3" style={{ marginBottom: 22 }}>
         {STEPS.map((s, i) => (
           <div key={i} className="card card-pad">
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
@@ -158,7 +158,7 @@ export default function Help() {
       </div>
 
       {/* Quick links */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+      <div className="grid-3" style={{ gap: 12 }}>
         {[
           { label: 'Перейти к ученикам', sub: 'Список всех учеников', path: '/students', color: 'var(--c-primary)' },
           { label: 'Загрузить учебники', sub: 'PDF для эталонных ответов', path: '/textbooks', color: 'var(--c-teal)' },

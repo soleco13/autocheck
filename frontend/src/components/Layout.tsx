@@ -3,9 +3,10 @@ import { Outlet, NavLink, useNavigate, useLocation, Link } from 'react-router-do
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Users, BookOpen, BookMarked, History, Settings, Home,
-  Search, HelpCircle, LogOut, PanelLeft, X, Square,
+  Search, HelpCircle, LogOut, PanelLeft, X, Square, Menu,
+  AlertTriangle, Activity,
 } from 'lucide-react'
-import { getMe, getStudents, logout } from '../api/client'
+import { getMe, getStudents, logout, getPlatformStatus } from '../api/client'
 import { toast } from './Toast'
 import { AppLogo } from './AppLogo'
 import { useCheckContext } from '../context/CheckContext'
@@ -24,6 +25,7 @@ export default function Layout() {
   const location = useLocation()
   const qc = useQueryClient()
   const [collapsed, setCollapsed] = useState(false)
+  const [mobileOpen, setMobileOpen] = useState(false)
   const [globalSearch, setGlobalSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const searchRef = useRef<HTMLInputElement>(null)
@@ -47,6 +49,7 @@ export default function Layout() {
 
   useEffect(() => {
     if (!globalSearch) setSearchOpen(false)
+    setMobileOpen(false) // close drawer on navigation
   }, [location.pathname])
 
   const handleLogout = async () => {
@@ -59,6 +62,16 @@ export default function Layout() {
     }
   }
 
+  const { data: platformData } = useQuery({
+    queryKey: ['platform-status'],
+    queryFn: getPlatformStatus,
+    refetchInterval: 60_000,
+    staleTime: 55_000,
+    retry: false,
+  })
+  const platformStatus: string = platformData?.status ?? 'ok'
+  const platformEnabled: boolean = platformData?.enabled ?? false
+
   const { bulkChecks, stopBulkCheck, stopAllBulkChecks } = useCheckContext()
   const activeBulk = [...bulkChecks.values()]
   const teacherName = (me as any)?.teacher?.full_name || me?.teacher?.email || 'Учитель'
@@ -66,8 +79,14 @@ export default function Layout() {
 
   return (
     <div className="app">
+      {/* Mobile overlay — closes sidebar when tapped */}
+      <div
+        className={`sidebar-overlay ${mobileOpen ? 'active' : ''}`}
+        onClick={() => setMobileOpen(false)}
+      />
+
       {/* Sidebar */}
-      <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
+      <aside className={`sidebar ${collapsed ? 'collapsed' : ''} ${mobileOpen ? 'mobile-open' : ''}`}>
         {/* Logo */}
         <div className="sidebar-logo">
           <AppLogo size={30} />
@@ -111,12 +130,41 @@ export default function Layout() {
 
       {/* Header */}
       <header className={`main-header ${collapsed ? 'collapsed-sidebar' : ''}`}>
-        <button className="btn btn-ghost btn-sm" onClick={() => navigate('/help')} style={{ fontWeight: 600 }}>
-          <HelpCircle size={18} /> Помощь
+        {/* Hamburger — visible only on mobile (CSS) */}
+        <button className="mobile-menu-btn" onClick={() => setMobileOpen(v => !v)} aria-label="Меню">
+          <Menu size={22} />
         </button>
 
+        <button className="btn btn-ghost btn-sm" onClick={() => navigate('/help')} style={{ fontWeight: 600 }}>
+          <HelpCircle size={18} /><span className="help-label"> Помощь</span>
+        </button>
+
+        {/* Platform status indicator — visible only when degraded/overloaded */}
+        {platformEnabled && (platformStatus === 'overloaded' || platformStatus === 'degraded') && (
+          <button
+            className="btn btn-sm"
+            onClick={() => navigate('/settings?tab=platform')}
+            title={platformStatus === 'overloaded' ? 'Платформа перегружена' : 'Платформа работает медленно'}
+            style={{
+              background: platformStatus === 'overloaded' ? '#fef2f2' : '#fffbeb',
+              border:     `1px solid ${platformStatus === 'overloaded' ? '#fecaca' : '#fde68a'}`,
+              color:      platformStatus === 'overloaded' ? '#dc2626' : '#d97706',
+              gap: 6, fontWeight: 600, fontSize: 13,
+              animation: platformStatus === 'overloaded' ? 'pulse 2s ease-in-out infinite' : 'none',
+            }}
+          >
+            {platformStatus === 'overloaded'
+              ? <AlertTriangle size={15} />
+              : <Activity size={15} />
+            }
+            <span className="help-label">
+              {platformStatus === 'overloaded' ? 'Перегружена' : 'Медленно'}
+            </span>
+          </button>
+        )}
+
         {/* Global search */}
-        <div className="search-wrap" style={{ flex: 1, maxWidth: 460, marginLeft: 6 }}>
+        <div className="search-wrap global-search" style={{ flex: 1, maxWidth: 460, marginLeft: 6 }}>
           <span className="search-icon"><Search size={17} /></span>
           <input
             ref={searchRef}
@@ -181,7 +229,8 @@ export default function Layout() {
 
         {/* User info */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 11, paddingLeft: 12, borderLeft: '1px solid var(--c-border-solid)' }}>
-          <div style={{ textAlign: 'right', lineHeight: 1.3 }}>
+          {/* Name + school hidden on mobile via .user-meta class */}
+          <div className="user-meta" style={{ textAlign: 'right', lineHeight: 1.3 }}>
             <div style={{ fontSize: 14, fontWeight: 650 }}>{teacherName}</div>
             <div style={{ fontSize: 12, color: 'var(--c-text-3)' }}>{(me as any)?.teacher?.school || 'AutoCheck'}</div>
           </div>
@@ -214,7 +263,7 @@ export default function Layout() {
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6, fontSize: 13 }}>
                     <span style={{ fontWeight: 700, color: 'var(--c-primary)' }}>
-                      Проверка · {bp.done} из {bp.total}
+                      Проверка · {Math.floor(bp.done)} из {bp.total}
                     </span>
                     <Link
                       to={`/students/${bp.studentId}`}
