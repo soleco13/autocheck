@@ -1,26 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 import pdfParse from 'pdf-parse';
-import { PDFDocument } from 'pdf-lib';
 import { db } from '../db';
 import { logger } from '../lib/logger';
-
-export const COVERS_DIR = path.join(process.cwd(), 'covers');
-
-async function extractCover(fileBuffer: Buffer, documentId: string): Promise<void> {
-  try {
-    fs.mkdirSync(COVERS_DIR, { recursive: true });
-    const srcDoc = await PDFDocument.load(fileBuffer, { ignoreEncryption: true });
-    const coverDoc = await PDFDocument.create();
-    const [firstPage] = await coverDoc.copyPages(srcDoc, [0]);
-    coverDoc.addPage(firstPage);
-    const coverBytes = await coverDoc.save();
-    fs.writeFileSync(path.join(COVERS_DIR, `${documentId}.pdf`), coverBytes);
-  } catch (err: any) {
-    // Обложка не критична — логируем и продолжаем
-    logger.warn({ documentId, err: err.message }, '[rag-indexer] cover extraction failed');
-  }
-}
+import { tryRenderCoverPng } from './cover-renderer';
 
 const CHUNK_TOKENS  = 600;
 const CHUNK_OVERLAP = 100;
@@ -136,8 +119,8 @@ export async function runIndexPipeline(documentId: string, filePath: string): Pr
 
     const fileBuffer = fs.readFileSync(filePath);
 
-    // Извлекаем обложку (первая страница PDF) до парсинга текста
-    await extractCover(fileBuffer, documentId);
+    // Рендерим обложку (первая страница PDF как PNG) до парсинга текста
+    await tryRenderCoverPng(fileBuffer, documentId);
 
     const parsed = await pdfParse(fileBuffer);
     const rawText = parsed.text;

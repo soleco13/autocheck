@@ -17,12 +17,16 @@ export interface RetrieverOptions {
 }
 
 export async function retrieveChunks(opts: RetrieverOptions): Promise<RetrievedChunk[]> {
-  const { query, teacherId, subjectCode, grade, topK = 5 } = opts;
+  const { query, subjectCode, grade, topK = 5 } = opts;
 
   if (!query.trim()) return [];
 
   // Обрезаем запрос — защита от гигантских промптов
   const safeQuery = query.slice(0, 500);
+
+  // Учебники — общий ресурс: любой загруженный любым учителем учебник
+  // используется для RAG-проверки всеми учителями системы (teacherId больше
+  // не фильтрует rag_documents).
 
   // ── Уровень 1: фильтр по subject_code + grade ─────────────────────────────
   // Полностью параметризованный запрос — $1 = query текст, никакой интерполяции
@@ -38,16 +42,15 @@ export async function retrieveChunks(opts: RetrieverOptions): Promise<RetrievedC
            ) AS score
          FROM rag_chunks tc
          JOIN rag_documents td ON td.id = tc.document_id
-         WHERE td.teacher_id   = $2
-           AND td.subject_code = $3
-           AND td.grade        = $4
+         WHERE td.subject_code = $2
+           AND td.grade        = $3
            AND td.status       = 'ready'
            AND tc.search_vector @@ (
              websearch_to_tsquery('russian', $1) || websearch_to_tsquery('english', $1)
            )
          ORDER BY score DESC
-         LIMIT $5`,
-        [safeQuery, teacherId, subjectCode, grade, topK],
+         LIMIT $4`,
+        [safeQuery, subjectCode, grade, topK],
       );
 
       if (rows.rows.length > 0) return mapRows(rows.rows);
@@ -57,7 +60,7 @@ export async function retrieveChunks(opts: RetrieverOptions): Promise<RetrievedC
   }
 
   // ── Уровень 2: тот же предмет, любой класс ───────────────────────────────
-  // Не используем "все учебники учителя" — учебник по математике не должен
+  // Не используем "все учебники подряд" — учебник по математике не должен
   // применяться при проверке русского языка и наоборот.
   if (subjectCode) {
     try {
@@ -71,15 +74,14 @@ export async function retrieveChunks(opts: RetrieverOptions): Promise<RetrievedC
            ) AS score
          FROM rag_chunks tc
          JOIN rag_documents td ON td.id = tc.document_id
-         WHERE td.teacher_id   = $2
-           AND td.subject_code = $3
+         WHERE td.subject_code = $2
            AND td.status       = 'ready'
            AND tc.search_vector @@ (
              websearch_to_tsquery('russian', $1) || websearch_to_tsquery('english', $1)
            )
          ORDER BY score DESC
-         LIMIT $4`,
-        [safeQuery, teacherId, subjectCode, topK],
+         LIMIT $3`,
+        [safeQuery, subjectCode, topK],
       );
 
       return mapRows(rows.rows);
@@ -106,12 +108,12 @@ export async function checkRagStatus(
 ): Promise<RagAvailability> {
   if (!subjectCode) return 'none';
   try {
-    // Проверяем все статусы для этого предмета
-    const params: any[] = [teacherId, subjectCode];
+    // Проверяем все статусы для этого предмета — учебники общие для всех учителей
+    const params: any[] = [subjectCode];
     const gradeClause = grade ? `AND grade = $${params.push(grade)}` : '';
     const r = await db.query(
       `SELECT status FROM rag_documents
-       WHERE teacher_id = $1 AND subject_code = $2 ${gradeClause}
+       WHERE subject_code = $1 ${gradeClause}
        ORDER BY CASE status WHEN 'ready' THEN 0 WHEN 'processing' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END
        LIMIT 1`,
       params,
@@ -146,23 +148,23 @@ export async function checkRagAvailability(
       return false;
     }
 
-    // Уровень 1: точное совпадение предмет + класс
+    // Уровень 1: точное совпадение предмет + класс (учебники общие для всех учителей)
     if (grade) {
       const r = await db.query(
         `SELECT 1 FROM rag_documents
-         WHERE teacher_id = $1 AND subject_code = $2 AND grade = $3 AND status = 'ready'
+         WHERE subject_code = $1 AND grade = $2 AND status = 'ready'
          LIMIT 1`,
-        [teacherId, subjectCode, grade],
+        [subjectCode, grade],
       );
       if (r.rows.length > 0) return true;
     }
 
-    // Уровень 2: тот же предмет, любой класс (учитель мог загрузить без указания класса)
+    // Уровень 2: тот же предмет, любой класс (учебник мог быть загружен без указания класса)
     const r2 = await db.query(
       `SELECT 1 FROM rag_documents
-       WHERE teacher_id = $1 AND subject_code = $2 AND status = 'ready'
+       WHERE subject_code = $1 AND status = 'ready'
        LIMIT 1`,
-      [teacherId, subjectCode],
+      [subjectCode],
     );
     return r2.rows.length > 0;
   } catch (err: any) {

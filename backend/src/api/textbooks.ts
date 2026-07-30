@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { COVERS_DIR } from '../services/rag-indexer';
+import { COVERS_DIR } from '../services/cover-renderer';
 import { Router, Response } from 'express';
 import multer from 'multer';
 import rateLimit from 'express-rate-limit';
@@ -46,16 +46,16 @@ const uploadLimiter = rateLimit({
 
 // ── GET /api/textbooks ────────────────────────────────────────────────────────
 
-router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
+router.get('/', requireAuth, async (_req: AuthRequest, res: Response) => {
   try {
+    // Учебники — общий ресурс: видны и используются всеми учителями системы,
+    // а не только тем, кто загрузил.
     const result = await db.query(
       `SELECT id, filename, title, author, subject_code, grade, lang,
               file_size_bytes, chunk_count, status, progress_step, progress_pct,
               error_msg, created_at, updated_at
        FROM rag_documents
-       WHERE teacher_id = $1
        ORDER BY created_at DESC`,
-      [req.teacherId],
     );
     res.json(result.rows);
   } catch (err: any) {
@@ -67,17 +67,17 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
 
 router.get('/:id/cover', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    // Убедимся что учебник принадлежит этому учителю
+    // Учебник — общий ресурс, доступен любому авторизованному учителю
     const check = await db.query(
-      `SELECT 1 FROM rag_documents WHERE id = $1 AND teacher_id = $2`,
-      [req.params.id, req.teacherId],
+      `SELECT 1 FROM rag_documents WHERE id = $1`,
+      [req.params.id],
     );
     if (!check.rows[0]) { res.status(404).end(); return; }
 
-    const coverPath = path.join(COVERS_DIR, `${req.params.id}.pdf`);
+    const coverPath = path.join(COVERS_DIR, `${req.params.id}.png`);
     if (!fs.existsSync(coverPath)) { res.status(404).end(); return; }
 
-    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Type', 'image/png');
     res.setHeader('Cache-Control', 'public, max-age=604800'); // 7 дней
     fs.createReadStream(coverPath).pipe(res);
   } catch (err: any) {
@@ -92,8 +92,8 @@ router.get('/:id/status', requireAuth, async (req: AuthRequest, res: Response) =
     const result = await db.query(
       `SELECT id, status, progress_step, progress_pct, chunk_count, error_msg, updated_at
        FROM rag_documents
-       WHERE id = $1 AND teacher_id = $2`,
-      [req.params.id, req.teacherId],
+       WHERE id = $1`,
+      [req.params.id],
     );
     if (!result.rows[0]) { res.status(404).json({ error: 'Учебник не найден' }); return; }
     res.json(result.rows[0]);
@@ -183,9 +183,9 @@ router.post(
         `UPDATE rag_documents
          SET status = 'pending', progress_step = NULL, progress_pct = 0,
              chunk_count = 0, error_msg = NULL, file_size_bytes = $1, updated_at = NOW()
-         WHERE id = $2 AND teacher_id = $3
+         WHERE id = $2
          RETURNING id`,
-        [file.size, req.params.id, req.teacherId],
+        [file.size, req.params.id],
       );
       if (!docResult.rows[0]) {
         res.status(404).json({ error: 'Учебник не найден' }); return;
@@ -219,13 +219,13 @@ router.delete('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const result = await db.query(
       `DELETE FROM rag_documents
-       WHERE id = $1 AND teacher_id = $2
+       WHERE id = $1
        RETURNING id`,
-      [req.params.id, req.teacherId],
+      [req.params.id],
     );
     if (!result.rows[0]) { res.status(404).json({ error: 'Учебник не найден' }); return; }
     // Удаляем файл обложки
-    try { fs.unlinkSync(path.join(COVERS_DIR, `${req.params.id}.pdf`)); } catch { /* уже нет */ }
+    try { fs.unlinkSync(path.join(COVERS_DIR, `${req.params.id}.png`)); } catch { /* уже нет */ }
     res.json({ ok: true });
   } catch (err: any) {
     res.status(500).json({ error: safeError(err) });

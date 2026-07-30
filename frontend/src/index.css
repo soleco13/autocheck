@@ -197,6 +197,7 @@ button { font-family: inherit; }
   border: 1px solid var(--c-border-solid);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-xs);
+  min-width: 0; /* без этого длинный nowrap-текст внутри растягивает grid/flex-колонку */
 }
 .card-pad { padding: 24px; }
 
