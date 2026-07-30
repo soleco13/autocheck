@@ -409,49 +409,81 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
               const correctVariants: any[] = comp.correctVariants || [];
               const correctIds = new Set(correctVariants.map((v: any) => v?.id ?? String(v)));
               const checkedSet = new Set(checked);
-
-              // Get ALL options in display order from shuffledVariants
-              const shuffledRaw = ownedVars[`${comp.id}shuffledVariants`];
-              const shuffledItems: any[] = shuffledRaw
-                ? (Object.values(shuffledRaw)[0] as any[] || []).sort((a: any, b: any) => a.index - b.index)
-                : [];
-              const allOptionIds = shuffledItems.length > 0
-                ? shuffledItems.map((it: any) => it.id as string)
-                : [...new Set([...checked, ...correctVariants.map((v: any) => v?.id ?? String(v))])];
-
-              const allOptions = allOptionIds.map((id: string) => {
-                const o = objById.get(id);
-                const text = o?.getComponent?.(CText)?.text ? stripHtml(o.getComponent(CText).text) : id;
-                return { id, text, isChecked: checkedSet.has(id), isCorrect: correctIds.has(id) };
-              });
-
-              const checkedTexts = allOptions.filter(o => o.isChecked).map(o => o.text);
-              const correctTexts = allOptions.filter(o => o.isCorrect).map(o => o.text);
-
-              // Platform isSolved (securedVars) is transient — available right after session completion
-              // but absent on re-check. Fall back to local comparison when unavailable.
-              const platformSolved: boolean | null = secResult?.isSolved ?? null;
-              const locallyCorrect: boolean | null = correctIds.size > 0
-                ? (checked.length === correctIds.size && checked.every((id: string) => correctIds.has(id)))
+              // Per-id correctness the platform actually graded (more reliable than a
+              // single aggregate isSolved when one mechanic bundles several questions).
+              const checkedCorrectIds: Set<string> | null = Array.isArray(secResult?.data?.checkedCorrect)
+                ? new Set(secResult.data.checkedCorrect as string[])
                 : null;
-              const isSolved = platformSolved ?? locallyCorrect;
+
+              // shuffledVariants is keyed by question-group id → its options in display
+              // order. A "Quiz" mechanic can bundle MULTIPLE stacked questions (each its
+              // own quiz_question group) under one component — must emit one task PER
+              // group, not just the first (Object.values(...)[0] used to silently drop
+              // every question after the first).
+              const shuffledRaw = ownedVars[`${comp.id}shuffledVariants`];
+              const groupEntries: Array<[string, any[]]> = shuffledRaw && typeof shuffledRaw === 'object'
+                ? Object.entries(shuffledRaw)
+                : [['', [...new Set([...checked, ...correctVariants.map((v: any) => v?.id ?? String(v))])]
+                    .map((id, index) => ({ id, index }))]];
+              const isMultiGroup = groupEntries.length > 1;
 
               const qCtx = getSlideContext(slide, obj, CText);
-              tasks.push({
-                componentId: comp.id,
-                taskType: 'quiz',
-                questionText: qCtx.problem,
-                studentAnswer: checkedTexts.join(', '),
-                studentAnswerStructured: {
-                  allOptions,
-                  _isSolved: isSolved,
-                  _slideNum: slideNum,
-                  _slideProblem: qCtx.problem || null,
-                  _answerKey: qCtx.answerKey || null,
-                  _criteria: qCtx.criteria || null,
-                },
-                correctAnswer: correctTexts.join(', '),
-              });
+
+              for (const [groupId, itemsRaw] of groupEntries) {
+                const items = [...itemsRaw].sort((a: any, b: any) => a.index - b.index);
+                const allOptions = items.map((it: any) => {
+                  const o = objById.get(it.id);
+                  const text = o?.getComponent?.(CText)?.text ? stripHtml(o.getComponent(CText).text) : it.id;
+                  return { id: it.id, text, isChecked: checkedSet.has(it.id), isCorrect: correctIds.has(it.id) };
+                });
+
+                const checkedTexts = allOptions.filter(o => o.isChecked).map(o => o.text);
+                const correctTexts = allOptions.filter(o => o.isCorrect).map(o => o.text);
+                const groupCheckedId = allOptions.find(o => o.isChecked)?.id;
+
+                // Platform isSolved (securedVars) is transient — available right after session
+                // completion but absent on re-check. Fall back to local comparison when unavailable.
+                const groupCorrectIds = new Set(allOptions.filter(o => o.isCorrect).map(o => o.id));
+                const locallyCorrect: boolean | null = groupCorrectIds.size > 0
+                  ? allOptions.filter(o => o.isChecked).length === groupCorrectIds.size
+                    && [...groupCorrectIds].every(id => checkedSet.has(id))
+                  : null;
+                const platformSolved: boolean | null = groupCheckedId && checkedCorrectIds
+                  ? checkedCorrectIds.has(groupCheckedId)
+                  : (isMultiGroup ? null : secResult?.isSolved ?? null);
+                const isSolved = platformSolved ?? locallyCorrect;
+
+                // Group-specific question prompt (quiz_question_text inside this group's
+                // subtree) so bundled questions don't bleed into each other's text.
+                let groupQuestionText = '';
+                const groupObj = groupId ? objById.get(groupId) : null;
+                if (groupObj) {
+                  for (const child of groupObj.getDeepChildren()) {
+                    if (child.tag !== 'quiz_question_text') continue;
+                    const t = child.getComponent?.(CText)?.text;
+                    if (t) { groupQuestionText = stripHtml(t); break; }
+                  }
+                }
+                const questionText = groupQuestionText || qCtx.problem;
+
+                tasks.push({
+                  // Keep componentId unchanged for the common single-question case so
+                  // existing DB rows (unique on platform_component_id) keep matching.
+                  componentId: isMultiGroup ? `${comp.id}_${groupId}` : comp.id,
+                  taskType: 'quiz',
+                  questionText,
+                  studentAnswer: checkedTexts.join(', '),
+                  studentAnswerStructured: {
+                    allOptions,
+                    _isSolved: isSolved,
+                    _slideNum: slideNum,
+                    _slideProblem: questionText || null,
+                    _answerKey: qCtx.answerKey || null,
+                    _criteria: qCtx.criteria || null,
+                  },
+                  correctAnswer: correctTexts.join(', '),
+                });
+              }
               break;
             }
           }
