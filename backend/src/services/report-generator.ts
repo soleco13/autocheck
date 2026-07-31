@@ -98,7 +98,7 @@ export async function generateReport(sessionId: string): Promise<string> {
 
       const teacherSummaryPrompt =
         `${teacherPromptBase}\n\n` +
-        `Ученик: ${session.student_name}, ${session.grade} класс. Тема: «${session.topic}». ` +
+        `Ученик: ${session.grade} класс. Тема: «${session.topic}». ` +
         `Оценка: ${grade} (${percentage.toFixed(0)}%). ` +
         `Верных: ${correctCount}/${answers.length}. ` +
         `Неверных: ${answers.filter((a: any) => a.status === 'incorrect').length}.`;
