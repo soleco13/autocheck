@@ -24,6 +24,7 @@ export default function StudentCard() {
   const [newEditorUrl, setNewEditorUrl] = useState('')
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState<string>('')
+  const [subjectFilter, setSubjectFilter] = useState<string>('')
   const [searchQuery, setSearchQuery] = useState('')
 
   const { data: student, isLoading: loadingStudent } = useQuery({
@@ -39,10 +40,19 @@ export default function StudentCard() {
   const works: any[] = worksData?.works ?? []
   const platformError: string | null = worksData?.platformError ?? null
 
+  // Unique subjects among this student's works — real platform catalog
+  // (skillId/skillName), same taxonomy as the Materials page filter.
+  const subjects = useMemo(() => {
+    const map = new Map<string, string>()
+    works.forEach(w => { if (w.subject_id) map.set(w.subject_id, w.subject_name || w.subject_id) })
+    return [...map.entries()].sort((a, b) => a[1].localeCompare(b[1], 'ru'))
+  }, [works])
+
   const filtered = useMemo(() => {
     let list = works
     if (statusFilter === 'checked') list = list.filter(w => !!w.check_status)
     else if (statusFilter === 'unchecked') list = list.filter(w => !w.check_status)
+    if (subjectFilter) list = list.filter(w => w.subject_id === subjectFilter)
     if (searchQuery.trim()) {
       const q = searchQuery.trim().toLowerCase()
       list = list.filter(w =>
@@ -52,7 +62,7 @@ export default function StudentCard() {
       )
     }
     return list
-  }, [works, statusFilter, searchQuery])
+  }, [works, statusFilter, subjectFilter, searchQuery])
 
   const totalPages = Math.ceil(filtered.length / PAGE_SIZE)
   const pagedWorks = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
@@ -210,6 +220,19 @@ export default function StudentCard() {
             </div>
           )}
 
+          {/* Subject filter — from this student's checked works */}
+          {subjects.length > 0 && (
+            <select
+              value={subjectFilter}
+              onChange={e => { setSubjectFilter(e.target.value); setPage(1) }}
+              className="input"
+              style={{ width: 'auto', height: 34, paddingTop: 4, paddingBottom: 4 }}
+            >
+              <option value="">Все предметы</option>
+              {subjects.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+            </select>
+          )}
+
           {/* Bulk buttons */}
           {uncheckedWithToken.length > 0 && !myBulkRunning && (
             <div style={{ display: 'flex', gap: 6 }}>
@@ -293,7 +316,7 @@ export default function StudentCard() {
           <div className="empty-state-icon"><FileText size={36} /></div>
           <p style={{ fontWeight: 600, margin: '0 0 6px' }}>Работ не найдено</p>
           <p style={{ margin: 0, fontSize: 13, color: 'var(--c-text-3)' }}>
-            {statusFilter ? 'Нет работ с таким статусом' : 'Нет назначенных материалов'}
+            {statusFilter || subjectFilter ? 'Нет работ с такими фильтрами' : 'Нет назначенных материалов'}
           </p>
         </div>
       ) : (

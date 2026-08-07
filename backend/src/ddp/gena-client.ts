@@ -275,6 +275,58 @@ export async function getMaterialTitleMap(loginToken: string): Promise<Map<strin
 }
 
 /**
+ * Returns a materialId → { skillId, skillName } map using the platform's real
+ * subject catalog (api.skills.getSkills + branch->skillId links). This is the
+ * same subject taxonomy shown on the Materials page filter — not the internal
+ * subject_code parsed from control sheets.
+ * Cached in Redis for 30 minutes — shared across all processes/restarts.
+ */
+const SKILL_MAP_CACHE_KEY = 'gena:material-skill-map';
+const SKILL_MAP_CACHE_TTL_S = 30 * 60;
+
+export async function getMaterialSkillMap(loginToken: string): Promise<Map<string, { skillId: string; skillName: string }>> {
+  const { cacheGet, cacheSet } = await import('../lib/redis-cache');
+
+  const cached = await cacheGet<Record<string, { skillId: string; skillName: string }>>(SKILL_MAP_CACHE_KEY);
+  if (cached) return new Map(Object.entries(cached));
+
+  const map = new Map<string, { skillId: string; skillName: string }>();
+  try {
+    await ensureAuthenticated(loginToken);
+    const [branches, skillsResult] = await Promise.all([
+      callGena(loginToken, 'api.materials.getAllBranchesWithMaterialsBySkills', {}),
+      callGena(loginToken, 'api.skills.getSkills', {}),
+    ]);
+
+    const skillNameById: Record<string, string> = {};
+    if (skillsResult && typeof skillsResult === 'object') {
+      for (const [skillId, skillData] of Object.entries(skillsResult as Record<string, any>)) {
+        const ru = (skillData as any)?.ru;
+        if (ru?.title) skillNameById[skillId] = ru.title;
+      }
+    }
+
+    if (Array.isArray(branches)) {
+      for (const branch of branches) {
+        const skillId: string = branch.skillId || '';
+        if (!skillId || !Array.isArray(branch.materials)) continue;
+        const skillName = skillNameById[skillId] || skillId;
+        for (const mat of branch.materials) {
+          if (mat._id) map.set(mat._id, { skillId, skillName });
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn('[gena] getMaterialSkillMap failed:', err.message?.slice(0, 80));
+  }
+
+  if (map.size > 0) {
+    await cacheSet(SKILL_MAP_CACHE_KEY, Object.fromEntries(map), SKILL_MAP_CACHE_TTL_S);
+  }
+  return map;
+}
+
+/**
  * Fetches teacher's classrooms from the platform.
  * Method: api.classRooms.getClassRooms (confirmed via DDP exploration).
  * Response: [{ _id, name, childs: [{ id: platformStudentId, fullName }] }]

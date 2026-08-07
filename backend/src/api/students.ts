@@ -4,7 +4,7 @@ import { safeError } from '../lib/safe-error';
 import { db } from '../db';
 import { syncStudentsForTeacher, syncClassroomsForTeacher } from '../services/session-fetcher';
 import { getDecryptedToken } from '../services/auth';
-import { getChildsMaterials, getMaterialTitleMap } from '../ddp/gena-client';
+import { getChildsMaterials, getMaterialTitleMap, getMaterialSkillMap } from '../ddp/gena-client';
 import { cacheGet, cacheSet, cacheDel } from '../lib/redis-cache';
 import { configStore } from '../lib/config-store';
 
@@ -62,24 +62,15 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
           JOIN classrooms cr ON cr.id = crs.classroom_id
           WHERE cr.teacher_id = $1
           GROUP BY crs.student_id
-        ),
-        subject_cte AS (
-          SELECT ss.student_id, ARRAY_AGG(DISTINCT cs.subject_code ORDER BY cs.subject_code) AS subjects
-          FROM student_sessions ss
-          JOIN control_sheets cs ON cs.id = ss.control_sheet_id
-          WHERE ss.teacher_id = $1 AND cs.subject_code IS NOT NULL
-          GROUP BY ss.student_id
         )
         SELECT
           s.id, s.platform_student_id, s.full_name, s.nickname, s.cached_at,
           COALESCE(NULLIF(s.grade, 0), gc.grade) AS grade,
-          COALESCE(cc.classrooms, ARRAY[]::text[]) AS classrooms,
-          COALESCE(sc.subjects, ARRAY[]::text[]) AS subjects
+          COALESCE(cc.classrooms, ARRAY[]::text[]) AS classrooms
         FROM students s
         JOIN teacher_students ts ON ts.student_id = s.id
         LEFT JOIN grade_cte gc ON gc.student_id = s.id
         LEFT JOIN classroom_cte cc ON cc.student_id = s.id
-        LEFT JOIN subject_cte sc ON sc.student_id = s.id
         WHERE ${where}
         ORDER BY s.full_name
         LIMIT $${limitIdx} OFFSET $${offsetIdx}
@@ -204,7 +195,25 @@ router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) =>
     // Store in Redis cache (even errors, to avoid hammering the platform)
     await cacheSet(cacheKey, { extras: platformExtras, error: platformError }, getWorksTtlSeconds());
 
-    res.json({ works: [...sessions, ...platformExtras], platformError });
+    const works = [...sessions, ...platformExtras];
+
+    // Attach real platform subjects (same catalog as the Materials page filter),
+    // matched by platform_material_id — replaces the internal subject_code guess.
+    try {
+      const loginToken = await getDecryptedToken(req.teacherId!);
+      if (loginToken) {
+        const skillMap = await getMaterialSkillMap(loginToken);
+        for (const w of works) {
+          const skill = skillMap.get(w.platform_material_id);
+          w.subject_id = skill?.skillId ?? null;
+          w.subject_name = skill?.skillName ?? null;
+        }
+      }
+    } catch (err: any) {
+      console.warn('[works] Skill map enrichment failed:', err.message);
+    }
+
+    res.json({ works, platformError });
   } catch (err: any) {
     console.error('Get works error:', err.message);
     res.status(500).json({ error: safeError(err) });
