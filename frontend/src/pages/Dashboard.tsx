@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Users, RefreshCw, AlertTriangle, Search, Grid2x2, List, ChevronRight, X } from 'lucide-react'
 import { getStudents, syncClassrooms } from '../api/client'
 import { toast } from '../components/Toast'
+import { getSubjectName } from '../lib/subjects'
 
 function SkelLine({ w = '100%', h = 14, mb = 0 }: { w?: string | number; h?: number; mb?: number }) {
   return <div className="skeleton" style={{ width: w, height: h, marginBottom: mb, borderRadius: 8 }} />
@@ -61,6 +62,7 @@ export default function Dashboard() {
   const [search, setSearch] = useState('')
   const [classroomFilter, setClassroomFilter] = useState('')
   const [gradeFilter, setGradeFilter] = useState('')
+  const [subjectFilter, setSubjectFilter] = useState('')
   const [view, setView] = useState<'grid' | 'list'>('grid')
 
   const { data: students = [], isLoading } = useQuery({
@@ -83,15 +85,23 @@ export default function Dashboard() {
     [...new Set(allStudents.map(s => s.grade).filter(Boolean))].sort((a, b) => a - b),
     [allStudents])
 
+  // Unique subjects (from checked works' control sheets)
+  const subjects = useMemo(() => {
+    const set = new Set<string>()
+    allStudents.forEach(s => (s.subjects ?? []).forEach((c: string) => set.add(c)))
+    return [...set].sort((a, b) => getSubjectName(a).localeCompare(getSubjectName(b), 'ru'))
+  }, [allStudents])
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     return allStudents.filter(s => {
       if (q && !s.full_name?.toLowerCase().includes(q)) return false
       if (classroomFilter && !(s.classrooms ?? []).includes(classroomFilter)) return false
       if (gradeFilter && String(s.grade) !== gradeFilter) return false
+      if (subjectFilter && !(s.subjects ?? []).includes(subjectFilter)) return false
       return true
     })
-  }, [allStudents, search, classroomFilter, gradeFilter])
+  }, [allStudents, search, classroomFilter, gradeFilter, subjectFilter])
 
   const hasClassrooms = allStudents.some(s => s.classrooms?.length > 0)
 
@@ -119,8 +129,8 @@ export default function Dashboard() {
     } finally { setSyncingClassrooms(false) }
   }
 
-  const resetFilters = () => { setSearch(''); setClassroomFilter(''); setGradeFilter('') }
-  const hasFilters = !!(search || classroomFilter || gradeFilter)
+  const resetFilters = () => { setSearch(''); setClassroomFilter(''); setGradeFilter(''); setSubjectFilter('') }
+  const hasFilters = !!(search || classroomFilter || gradeFilter || subjectFilter)
 
   return (
     <div className="content-max fade-in">
@@ -184,6 +194,15 @@ export default function Dashboard() {
               value={gradeFilter} onChange={e => setGradeFilter(e.target.value)}>
               <option value="">Все классы</option>
               {grades.map(g => <option key={g} value={String(g)}>{g} класс</option>)}
+            </select>
+          )}
+
+          {/* Subject filter — from checked works */}
+          {subjects.length > 0 && (
+            <select className="input" style={{ width: 'auto', maxWidth: 220 }}
+              value={subjectFilter} onChange={e => setSubjectFilter(e.target.value)}>
+              <option value="">Все предметы</option>
+              {subjects.map(code => <option key={code} value={code}>{getSubjectName(code)}</option>)}
             </select>
           )}
 

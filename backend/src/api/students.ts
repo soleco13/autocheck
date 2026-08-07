@@ -62,15 +62,24 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
           JOIN classrooms cr ON cr.id = crs.classroom_id
           WHERE cr.teacher_id = $1
           GROUP BY crs.student_id
+        ),
+        subject_cte AS (
+          SELECT ss.student_id, ARRAY_AGG(DISTINCT cs.subject_code ORDER BY cs.subject_code) AS subjects
+          FROM student_sessions ss
+          JOIN control_sheets cs ON cs.id = ss.control_sheet_id
+          WHERE ss.teacher_id = $1 AND cs.subject_code IS NOT NULL
+          GROUP BY ss.student_id
         )
         SELECT
           s.id, s.platform_student_id, s.full_name, s.nickname, s.cached_at,
           COALESCE(NULLIF(s.grade, 0), gc.grade) AS grade,
-          COALESCE(cc.classrooms, ARRAY[]::text[]) AS classrooms
+          COALESCE(cc.classrooms, ARRAY[]::text[]) AS classrooms,
+          COALESCE(sc.subjects, ARRAY[]::text[]) AS subjects
         FROM students s
         JOIN teacher_students ts ON ts.student_id = s.id
         LEFT JOIN grade_cte gc ON gc.student_id = s.id
         LEFT JOIN classroom_cte cc ON cc.student_id = s.id
+        LEFT JOIN subject_cte sc ON sc.student_id = s.id
         WHERE ${where}
         ORDER BY s.full_name
         LIMIT $${limitIdx} OFFSET $${offsetIdx}
