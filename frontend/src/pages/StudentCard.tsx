@@ -69,8 +69,9 @@ export default function StudentCard() {
 
   const checkedCount = works.filter(w => !!w.check_status).length
   const uncheckedCount = works.filter(w => !w.check_status).length
-  // Only unchecked works with a trainerToken can be bulk-checked
-  const uncheckedWithToken = works.filter(w => !w.check_status && w.trainer_token)
+  // Only unchecked, submitted works with a trainerToken can be bulk-checked
+  const uncheckedWithToken = works.filter(w =>
+    !w.check_status && w.trainer_token && (!w.platform_status || w.platform_status === 'done'))
 
   // Is bulk running for THIS student?
 
@@ -339,6 +340,10 @@ export default function StudentCard() {
                 const edikUrl = work.trainer_token
                   ? `${EDIK_BASE}/s/${work.trainer_token}`
                   : null
+                // Work is checkable once submitted ('done') or already has a
+                // report; platform_status is only set on not-yet-checked
+                // platform materials, so its absence means it's checkable.
+                const canCheck = !!work.check_status || !work.platform_status || work.platform_status === 'done'
 
                 return (
                   <tr
@@ -387,6 +392,8 @@ export default function StudentCard() {
                         </span>
                       ) : work.check_status ? (
                         <StatusBadge status={work.check_status} />
+                      ) : work.platform_status && work.platform_status !== 'done' ? (
+                        <StatusBadge status={work.platform_status} />
                       ) : (
                         <span className="badge badge-gray"><Clock size={10} />Не проверено</span>
                       )}
@@ -407,17 +414,19 @@ export default function StudentCard() {
                             Отчёт
                           </Link>
                         )}
-                        <button
-                          onClick={() => runCheck(id!, matId, work.trainer_token, () => refetch())}
-                          disabled={isItemChecking}
-                          className="btn btn-primary btn-sm"
-                          title={work.check_status ? 'Перепроверить' : 'Проверить'}
-                        >
-                          {isItemChecking
-                            ? <span className="spinner" style={{ width: 12, height: 12, borderWidth: 2 }} />
-                            : <><Play size={12} />{work.check_status ? 'Ещё раз' : 'Проверить'}</>
-                          }
-                        </button>
+                        {canCheck && (
+                          <button
+                            onClick={() => runCheck(id!, matId, work.trainer_token, () => refetch())}
+                            disabled={isItemChecking}
+                            className="btn btn-primary btn-sm"
+                            title={work.check_status ? 'Перепроверить' : 'Проверить'}
+                          >
+                            {isItemChecking
+                              ? <span className="spinner" style={{ width: 12, height: 12, borderWidth: 2 }} />
+                              : <><Play size={12} />{work.check_status ? 'Ещё раз' : 'Проверить'}</>
+                            }
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>

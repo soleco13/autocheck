@@ -159,19 +159,21 @@ router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) =>
             platformError = 'Не удалось загрузить материалы с платформы (сервер временно недоступен)';
           }
 
-          // New format: [{materialId, activity, interactiveData}]
-          // Filter to 'done' materials not yet checked
-          const doneMaterials = materials.filter((m: any) => {
+          // New format: [{materialId, activity, interactiveData, status}]
+          // Show every assigned material not yet checked, regardless of
+          // submission status — the platform status is surfaced to the UI
+          // instead of being used to hide in-progress/not-started work.
+          const otherMaterials = materials.filter((m: any) => {
             const mid = m.materialId || m._id;
-            if (!mid || checkedIds.has(mid)) return false;
-            const lastStatus = m.activity?.filter((a: any) => a.t === 'changeStatus')?.slice(-1)[0];
-            return lastStatus?.d?.to === 'done';
+            return !!mid && !checkedIds.has(mid);
           });
 
-          platformExtras = doneMaterials.map((m: any) => {
+          platformExtras = otherMaterials.map((m: any) => {
             const mid = m.materialId || m._id;
             const trainerToken = m.interactiveData?.trainerToken || null;
             const title = titleMap.get(mid) || null;
+            const lastStatus = m.activity?.filter((a: any) => a.t === 'changeStatus')?.slice(-1)[0];
+            const platformStatus = m.status || lastStatus?.d?.to || 'notStarted';
             return {
               id: null,
               platform_material_id: mid,
@@ -183,6 +185,7 @@ router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) =>
               report_grade: null,
               percentage: null,
               trainer_token: trainerToken,
+              platform_status: platformStatus,
             };
           });
         }
