@@ -1,15 +1,11 @@
 import { Router } from 'express';
-import Anthropic from '@anthropic-ai/sdk';
 import { requireAuth } from '../middleware/auth-middleware';
 import { getMontiMetrics, getMontiStatus, isMontiEnabled } from '../ddp/monti-client';
+import { getOpenRouterClient } from '../lib/openrouter-client';
 import { logger } from '../lib/logger';
 
 const router = Router();
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  ...(process.env.ANTHROPIC_BASE_URL ? { baseURL: process.env.ANTHROPIC_BASE_URL } : {}),
-});
-const REPORT_MODEL = process.env.AI_REPORT_MODEL || 'claude-sonnet-4-6';
+const REPORT_MODEL = process.env.AI_REPORT_MODEL || 'anthropic/claude-sonnet-5';
 const COOLDOWN_MS = 10 * 60_000;
 let lastReport = 0;
 
@@ -46,13 +42,13 @@ ${fmtTS(metrics.timeseries.responseTime, ['db', 'async'])}`;
 
   try {
     lastReport = Date.now();
-    const msg = await anthropic.messages.create({
+    const client = getOpenRouterClient();
+    const response = await client.chat.completions.create({
       model: REPORT_MODEL,
       max_tokens: 800,
       messages: [{ role: 'user', content: prompt }],
     });
-    const textBlock = msg.content.find((b: any) => b.type === 'text' && b.text);
-    const text = textBlock ? (textBlock as any).text : '';
+    const text = response.choices[0]?.message?.content ?? '';
     res.json({ report: text, status, metrics, generatedAt: new Date().toISOString() });
   } catch (err: any) {
     lastReport = 0;

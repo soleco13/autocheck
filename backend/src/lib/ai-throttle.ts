@@ -1,8 +1,8 @@
 /**
- * Global sliding-window rate throttle for Anthropic API calls.
+ * Global sliding-window rate throttle for OpenRouter API calls.
  *
  * All callers (ai-checker, report-generator) await `aiThrottle.acquire()`
- * before making any claude API call. This proactively prevents 429 errors
+ * before making any OpenRouter API call. This proactively prevents 429 errors
  * instead of relying on SDK retry/backoff which causes cascading delays under bulk load.
  *
  * The limit is read from configStore on every acquire() so UI changes take effect
@@ -25,10 +25,10 @@ class AiThrottle {
   private readonly maxQueueDepth = 500;
 
   private getMax(): number {
-    try { return Math.max(1, cfg().get('anthropic_rpm')); } catch { return 25; }
+    try { return Math.max(1, cfg().get('openrouter_rpm')); } catch { return 25; }
   }
 
-  /** Wait for an available Anthropic API rate-limit slot. */
+  /** Wait for an available OpenRouter API rate-limit slot. */
   acquire(): Promise<void> {
     if (this.pending.length >= this.maxQueueDepth) {
       return Promise.reject(new Error(`AI rate-limit queue full (${this.maxQueueDepth} waiting). Retry later.`));

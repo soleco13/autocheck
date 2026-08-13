@@ -15,17 +15,17 @@ const PROMPT_META: Record<string, { label: string; desc: string; model: string }
   checker_system: {
     label: 'Системный промпт проверки',
     desc: 'Инструкции для ИИ при проверке каждого ответа ученика. Влияет на строгость, тон и критерии оценки.',
-    model: 'claude-sonnet-4-6',
+    model: 'anthropic/claude-haiku-4.5',
   },
   report_student: {
     label: 'Промпт комментария ученику',
     desc: 'Как ИИ формулирует обратную связь для ученика в итоговом отчёте.',
-    model: 'claude-sonnet-4-6',
+    model: 'anthropic/claude-sonnet-5',
   },
   report_teacher: {
     label: 'Промпт рекомендаций учителю',
     desc: 'Профессиональная сводка и рекомендации для преподавателя в итоговом отчёте.',
-    model: 'claude-sonnet-4-6',
+    model: 'anthropic/claude-sonnet-5',
   },
 }
 
@@ -508,8 +508,8 @@ export default function Settings() {
 
             <div style={{ marginTop: 18, paddingTop: 18, borderTop: '1px solid var(--c-border-solid)', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
               {[
-                { label: 'Модель проверки', value: 'claude-haiku-4.5' },
-                { label: 'Модель отчётов', value: 'claude-sonnet-4.6' },
+                { label: 'Модель проверки', value: 'anthropic/claude-haiku-4.5' },
+                { label: 'Модель отчётов', value: 'anthropic/claude-sonnet-5' },
                 { label: 'Платформа', value: 'good-teach.itgen.io' },
                 { label: 'База данных', value: 'PostgreSQL 16' },
               ].map(({ label, value }) => (

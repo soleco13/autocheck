@@ -12,7 +12,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 // ── Validate required secrets at startup ──────────────────────────────────
-const REQUIRED_ENV = ['JWT_SECRET', 'TOKEN_ENCRYPTION_KEY', 'ANTHROPIC_API_KEY', 'DATABASE_URL'];
+const REQUIRED_ENV = ['JWT_SECRET', 'TOKEN_ENCRYPTION_KEY', 'OPENROUTER_API_KEY', 'DATABASE_URL'];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key] || process.env[key] === 'fallback_secret') {
     console.error(`❌ Required env var ${key} is missing or placeholder. Refusing to start.`);

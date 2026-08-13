@@ -27,9 +27,9 @@ export const PARAM_META: Record<string, ParamMeta> = {
     description: 'Сколько работ воркер обрабатывает одновременно. Изменение вступает в силу после перезапуска.',
     category: 'ai', type: 'int', default: 5, min: 1, max: 20, live: false,
   },
-  anthropic_rpm: {
-    label: 'Anthropic — лимит вызовов в минуту', unit: 'вызовов/мин',
-    description: 'Максимум запросов к Claude API в минуту (глобально). Держите ниже лимита аккаунта Anthropic.',
+  openrouter_rpm: {
+    label: 'OpenRouter — лимит вызовов в минуту', unit: 'вызовов/мин',
+    description: 'Максимум запросов к OpenRouter API в минуту (глобально). Держите ниже лимита аккаунта OpenRouter.',
     category: 'ai', type: 'int', default: 25, min: 5, max: 500, live: true,
   },
 

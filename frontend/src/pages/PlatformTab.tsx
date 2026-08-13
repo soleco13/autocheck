@@ -222,7 +222,7 @@ function AiReport() {
       {report && (
         <div style={{ marginTop: 18, borderTop: '1px solid var(--c-primary-muted)', paddingTop: 16 }}>
           <div style={{ fontSize: 11.5, color: 'var(--c-text-3)', marginBottom: 10 }}>
-            Сгенерировано {new Date(report.generatedAt).toLocaleString('ru-RU')} · claude-sonnet-4-6
+            Сгенерировано {new Date(report.generatedAt).toLocaleString('ru-RU')} · anthropic/claude-sonnet-5
           </div>
           <div style={{ background: 'rgba(255,255,255,0.7)', borderRadius: 12, padding: '16px 18px' }}>
             {formatReport(report.text)}

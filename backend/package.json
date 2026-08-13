@@ -11,7 +11,6 @@
     "migrate": "ts-node --files src/db/migrate.ts"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.27.0",
     "@bull-board/api": "^7.1.5",
     "@bull-board/express": "^7.1.5",
     "@itgenio/edik-core": "^0.0.142",
@@ -29,6 +28,7 @@
     "ioredis": "^5.3.2",
     "jsonwebtoken": "^9.0.2",
     "multer": "^1.4.5-lts.1",
+    "openai": "^6.49.0",
     "pdf-parse": "^1.1.4",
     "pdfjs-dist": "^3.11.174",
     "pg": "^8.11.3",

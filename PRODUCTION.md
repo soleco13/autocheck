@@ -15,8 +15,10 @@ DATABASE_URL=postgresql://postgres:PASSWORD@localhost:5432/autocheck
 REDIS_URL=redis://localhost:6379
 JWT_SECRET=<64-hex-char random string>
 TOKEN_ENCRYPTION_KEY=<64-hex-char random string>
-ANTHROPIC_API_KEY=sk-ant-api03-...   # Official Anthropic API key
-# ANTHROPIC_BASE_URL — do NOT set in production (use official endpoint)
+OPENROUTER_API_KEY=sk-or-v1-...      # https://openrouter.ai/keys
+AI_CHECKER_MODEL=anthropic/claude-haiku-4.5
+AI_FALLBACK_MODEL=openai/gpt-5-mini
+AI_REPORT_MODEL=anthropic/claude-sonnet-5
 PORT=3001
 NODE_ENV=production
 FRONTEND_URL=https://yourdomain.com

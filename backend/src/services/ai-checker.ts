@@ -1,18 +1,19 @@
-import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import crypto from 'crypto';
 import { db } from '../db';
 import { aiThrottle } from '../lib/ai-throttle';
 import { DEFAULT_PROMPTS } from '../api/settings';
 import { configStore } from '../lib/config-store';
+import { getOpenRouterClient } from '../lib/openrouter-client';
 import { retrieveChunks, checkRagAvailability, checkRagStatus } from './rag-retriever';
 
-const CHECKER_MODEL  = process.env.AI_CHECKER_MODEL  || 'claude-haiku-4-5-20251001';
-const FALLBACK_MODEL = process.env.AI_FALLBACK_MODEL || 'claude-sonnet-4-6';
+const CHECKER_MODEL  = process.env.AI_CHECKER_MODEL  || 'anthropic/claude-haiku-4.5';
+const FALLBACK_MODEL = process.env.AI_FALLBACK_MODEL || 'openai/gpt-5-mini';
 
-// ── Claude circuit breaker ────────────────────────────────────────────────────
-// After 2 consecutive transient failures, skip Claude for 5 min and go
-// directly to GPT. Prevents wasting 0.5–2 s per answer waiting for Anthropic
-// to respond with 400/5xx when it's clearly unavailable.
+// ── Primary-model circuit breaker ─────────────────────────────────────────────
+// After 2 consecutive transient failures, skip the primary model for 5 min and go
+// directly to the fallback. Prevents wasting 0.5–2 s per answer waiting for a
+// provider to respond with 400/5xx when it's clearly unavailable.
 const CIRCUIT_FAIL_THRESHOLD = 2;
 const CIRCUIT_OPEN_DURATION_MS = 5 * 60_000;
 let circuitFailures = 0;
@@ -23,13 +24,13 @@ export function isCircuitOpen(): boolean {
   if (circuitOpenUntil > 0) { circuitOpenUntil = 0; circuitFailures = 0; } // half-open reset
   return false;
 }
-function onClaudeSuccess(): void { circuitFailures = 0; circuitOpenUntil = 0; }
-function onClaudeFailure(): void {
+function onPrimarySuccess(): void { circuitFailures = 0; circuitOpenUntil = 0; }
+function onPrimaryFailure(): void {
   circuitFailures++;
   // Log only on the exact threshold — parallel jobs can all fail at once, we
   // don't want N identical "circuit OPEN" lines per wave of concurrent requests.
   if (circuitFailures === CIRCUIT_FAIL_THRESHOLD) {
-    console.warn('[ai-checker] Claude circuit OPEN — routing to GPT for 5 min');
+    console.warn(`[ai-checker] ${CHECKER_MODEL} circuit OPEN — routing to ${FALLBACK_MODEL} for 5 min`);
   }
   if (circuitFailures >= CIRCUIT_FAIL_THRESHOLD) {
     circuitOpenUntil = Date.now() + CIRCUIT_OPEN_DURATION_MS;
@@ -64,31 +65,17 @@ export async function getTeacherPrompt(teacherId: string | null, key: string): P
   }
 }
 
-let anthropic: Anthropic | null = null;
-
-function getClient(): Anthropic {
-  if (!anthropic) {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    const baseURL = process.env.ANTHROPIC_BASE_URL;
-    if (!apiKey || apiKey === 'your_anthropic_api_key_here') {
-      throw new Error('ANTHROPIC_API_KEY not configured');
-    }
-    anthropic = new Anthropic({
-      apiKey,
-      ...(baseURL ? { baseURL } : {}),
-      maxRetries: 3,
-    });
-  }
-  return anthropic;
+function getClient(): OpenAI {
+  return getOpenRouterClient();
 }
 
-// ── GPT fallback ─────────────────────────────────────────────────────────────
-// Used when claude-haiku-4.5 is unavailable (Anthropic outage / 5xx / overload).
-// Calls the proxy's OpenAI-compatible endpoint which routes to gpt-5.4.
+// ── Fallback model ───────────────────────────────────────────────────────────
+// Used when the primary model is unavailable (provider outage / 5xx / overload).
+// OpenRouter fronts many providers behind one OpenAI-compatible endpoint.
 function isTransientError(err: any): boolean {
   if (typeof err?.status === 'number' && (err.status >= 500 || err.status === 429)) return true;
-  // ClaudeHub returns 400 "Model not found" when Claude models aren't available on the plan.
-  // Some aggregators return 400 "Invalid request parameters" instead of 429 when rate-limited.
+  // Some providers return 400 "Model not found" / "Invalid request parameters" instead of a
+  // proper 404/429 when a model is unavailable or rate-limited.
   if (err?.status === 400) {
     const body = String(err?.message ?? '').toLowerCase();
     if (body.includes('model not found') || body.includes('model_not_found') ||
@@ -98,15 +85,6 @@ function isTransientError(err: any): boolean {
   return msg.includes('overload') || msg.includes('timeout') ||
          msg.includes('econnreset') || msg.includes('fetch failed') ||
          msg.includes('503') || msg.includes('529');
-}
-
-// Proxy returns extended-thinking responses with [thinking, text] blocks.
-// Always find the first 'text' block instead of assuming content[0] is text.
-function extractTextBlock(content: Anthropic.ContentBlock[]): string {
-  for (const block of content) {
-    if (block.type === 'text' && block.text) return block.text;
-  }
-  return '';
 }
 
 // Robust JSON extractor: strips markdown fences, finds the first valid JSON opener.
@@ -128,38 +106,45 @@ function extractJSON(raw: string, opener: '{' | '['): string {
 
 export async function callGPTFallback(userPrompt: string, systemPrompt: string, maxTokens: number): Promise<string> {
   const client = getClient();
-  const response = await client.messages.create({
+  const response = await client.chat.completions.create({
     model: FALLBACK_MODEL,
     max_tokens: maxTokens,
-    system: systemPrompt,
-    messages: [{ role: 'user', content: userPrompt }],
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
   });
-  return extractTextBlock(response.content);
+  return response.choices[0]?.message?.content ?? '';
 }
 
 async function callAIGetText(
   userPrompt: string,
   systemPrompt: string,
   maxTokens: number,
-  client: Anthropic,
+  client: OpenAI,
 ): Promise<{ text: string; usage: { input_tokens: number; output_tokens: number } }> {
   if (!isCircuitOpen()) {
     try {
-      const response = await client.messages.create({
+      const response = await client.chat.completions.create({
         model: CHECKER_MODEL,
         max_tokens: maxTokens,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }],
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
       });
-      onClaudeSuccess();
+      onPrimarySuccess();
       return {
-        text: extractTextBlock(response.content),
-        usage: { input_tokens: response.usage.input_tokens, output_tokens: response.usage.output_tokens },
+        text: response.choices[0]?.message?.content ?? '',
+        usage: {
+          input_tokens: response.usage?.prompt_tokens ?? 0,
+          output_tokens: response.usage?.completion_tokens ?? 0,
+        },
       };
     } catch (err: any) {
       if (!isTransientError(err)) throw err;
-      onClaudeFailure();
-      console.warn(`[ai-checker] Claude unavailable (${err.message?.slice(0, 60)}), using fallback`);
+      onPrimaryFailure();
+      console.warn(`[ai-checker] ${CHECKER_MODEL} unavailable (${err.message?.slice(0, 60)}), using fallback`);
     }
   }
   const text = await callGPTFallback(userPrompt, systemPrompt, maxTokens);

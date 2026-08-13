@@ -1,25 +1,20 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { db } from '../db';
 import { aiThrottle } from '../lib/ai-throttle';
+import { getOpenRouterClient } from '../lib/openrouter-client';
 import { getTeacherPrompt, callGPTFallback, isCircuitOpen } from './ai-checker';
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  ...(process.env.ANTHROPIC_BASE_URL ? { baseURL: process.env.ANTHROPIC_BASE_URL } : {}),
-  maxRetries: 0,
-});
-const MODEL = process.env.AI_REPORT_MODEL || process.env.AI_CHECKER_MODEL || 'claude-sonnet-4-6';
+const MODEL = process.env.AI_REPORT_MODEL || process.env.AI_CHECKER_MODEL || 'anthropic/claude-sonnet-5';
 
 async function callReportAI(userPrompt: string): Promise<string> {
   if (!isCircuitOpen()) {
     try {
-      const msg = await anthropic.messages.create({
+      const client = getOpenRouterClient();
+      const response = await client.chat.completions.create({
         model: MODEL,
         max_tokens: 1200,
         messages: [{ role: 'user', content: userPrompt }],
       });
-      const textBlock = msg.content.find((b: any) => b.type === 'text' && b.text);
-      return textBlock ? (textBlock as any).text : '';
+      return response.choices[0]?.message?.content ?? '';
     } catch (err: any) {
       const status: number = err?.status ?? 0;
       const body = String(err?.message ?? '').toLowerCase();
@@ -27,7 +22,7 @@ async function callReportAI(userPrompt: string): Promise<string> {
         (status === 400 && (body.includes('model not found') || body.includes('model_not_found'))) ||
         body.includes('overload') || body.includes('timeout');
       if (!isTransient) throw err;
-      console.warn(`[report-generator] Claude unavailable, using GPT fallback`);
+      console.warn(`[report-generator] ${MODEL} unavailable, using fallback`);
     }
   }
   return callGPTFallback(userPrompt, 'Ты помощник учителя. Отвечай кратко и по-русски.', 1200);
@@ -81,7 +76,7 @@ export async function generateReport(sessionId: string): Promise<string> {
   const teacherRow = await db.query('SELECT teacher_id FROM student_sessions WHERE id = $1', [sessionId]);
   const teacherId: string | null = teacherRow.rows[0]?.teacher_id ?? null;
 
-  if (process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY !== 'your_anthropic_api_key_here') {
+  if (process.env.OPENROUTER_API_KEY && process.env.OPENROUTER_API_KEY !== 'your_openrouter_api_key_here') {
     try {
       // Load teacher-customisable prompts from DB (cached 5 min), fall back to defaults
       const [studentPromptBase, teacherPromptBase] = await Promise.all([
