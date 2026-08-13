@@ -69,9 +69,10 @@ export default function StudentCard() {
 
   const checkedCount = works.filter(w => !!w.check_status).length
   const uncheckedCount = works.filter(w => !w.check_status).length
-  // Only unchecked, submitted works with a trainerToken can be bulk-checked
+  // Only unchecked works with a trainerToken can be bulk-checked; 'notStarted'
+  // works have no meaningful answers yet, so they're excluded.
   const uncheckedWithToken = works.filter(w =>
-    !w.check_status && w.trainer_token && (!w.platform_status || w.platform_status === 'done'))
+    !w.check_status && w.trainer_token && w.platform_status !== 'notStarted')
 
   // Is bulk running for THIS student?
 
@@ -340,10 +341,9 @@ export default function StudentCard() {
                 const edikUrl = work.trainer_token
                   ? `${EDIK_BASE}/s/${work.trainer_token}`
                   : null
-                // Work is checkable once submitted ('done') or already has a
-                // report; platform_status is only set on not-yet-checked
-                // platform materials, so its absence means it's checkable.
-                const canCheck = !!work.check_status || !work.platform_status || work.platform_status === 'done'
+                // Work is checkable in any status except 'notStarted' (no
+                // answers yet) or if it already has a report (recheck).
+                const canCheck = !!work.check_status || work.platform_status !== 'notStarted'
 
                 return (
                   <tr

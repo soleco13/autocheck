@@ -371,7 +371,7 @@ export default function MaterialDetail() {
                 const isItemChecking = checking.has(key)
                 const itemStatus = checkStatuses[key]
                 const reportId = checkReports[key] || student.reportId || student.sessionId
-                const canCheck = student.status === 'done' && student.trainerToken && !student.reportId && !checkReports[key]
+                const canCheck = student.status !== 'notStarted' && student.trainerToken && !student.reportId && !checkReports[key]
                 const edikUrl = student.trainerToken ? `${EDIK_BASE}/s/${student.trainerToken}` : null
 
                 return (
