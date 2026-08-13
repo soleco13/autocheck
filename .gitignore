@@ -53,6 +53,9 @@ redis/
 # Local test data (uploaded student PDFs)
 backend/covers/
 
+# DB backups (dumps may contain PII; large binaries, don't belong in git)
+backups/
+
 # Secrets / local tokens
 token.txt
 
