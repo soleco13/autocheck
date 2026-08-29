@@ -13,7 +13,7 @@ import { Donut } from '../components/Charts'
 
 const TYPE_LABEL: Record<string, string> = {
   check_value: 'Число', open_answer: 'Открытый ответ', matches: 'Соответствие',
-  input: 'Ввод', quiz: 'Тест', fill_blanks: 'Пропуски',
+  input: 'Ввод', quiz: 'Тест', fill_blanks: 'Пропуски', photo_answer: 'Фото-ответ',
 }
 
 const ATTENTION = ['incorrect', 'partial', 'manual_required']
@@ -208,8 +208,13 @@ function TaskCard({ ans, globalIdx, expanded, onToggle, flash, overrides, setSco
                 </AnswerPanel>
               )}
 
+              {/* PHOTO ANSWER */}
+              {ans.task_type === 'photo_answer' && (
+                <PhotoStrip answerId={ans.id} photos={structured?.photos} />
+              )}
+
               {/* GENERIC */}
-              {!['quiz', 'fill_blanks', 'matches'].includes(ans.task_type) && (ans.student_answer || ans.task_reference_answer) && (
+              {!['quiz', 'fill_blanks', 'matches', 'photo_answer'].includes(ans.task_type) && (ans.student_answer || ans.task_reference_answer) && (
                 <GenericAns status={ans.status} studentAnswer={ans.student_answer} reference={ans.task_reference_answer} />
               )}
 
@@ -268,6 +273,33 @@ function AnswerPanel({ label, children }: { label?: string; children: React.Reac
       {label && <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--c-text-3)', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 11 }}>{label}</div>}
       {children}
     </div>
+  )
+}
+
+function PhotoStrip({ answerId, photos }: { answerId: string; photos?: Array<{ name?: string }> }) {
+  const list = Array.isArray(photos) ? photos : []
+  if (list.length === 0) {
+    return (
+      <AnswerPanel label="Фото решения ученика">
+        <span style={{ fontSize: 13.5, color: 'var(--c-text-3)' }}>Фото не прикреплено.</span>
+      </AnswerPanel>
+    )
+  }
+  return (
+    <AnswerPanel label="Фото решения ученика">
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+        {list.map((p, i) => {
+          const src = `/api/reports/answers/${answerId}/photo/${i}`
+          return (
+            <a key={i} href={src} target="_blank" rel="noreferrer"
+              style={{ display: 'block', borderRadius: 10, overflow: 'hidden', border: '1px solid var(--c-border-solid)', lineHeight: 0 }}>
+              <img src={src} alt={p.name || `Фото ${i + 1}`} loading="lazy"
+                style={{ display: 'block', maxWidth: 240, maxHeight: 280, objectFit: 'cover', background: 'var(--c-surface-3)' }} />
+            </a>
+          )
+        })}
+      </div>
+    </AnswerPanel>
   )
 }
 
@@ -333,7 +365,13 @@ function SubAnswerRow({ ans, partNum, overrides, setScore }: {
         </span>
       </div>
 
-      {(ans.student_answer || ans.task_reference_answer) && (
+      {ans.task_type === 'photo_answer' && (
+        <div style={{ marginBottom: 8, marginLeft: 60 }}>
+          <PhotoStrip answerId={ans.id} photos={ans.student_answer_structured?.photos} />
+        </div>
+      )}
+
+      {ans.task_type !== 'photo_answer' && (ans.student_answer || ans.task_reference_answer) && (
         <div style={{ marginBottom: 8, marginLeft: 60 }}>
           <GenericAns status={ans.status} studentAnswer={ans.student_answer} reference={ans.task_reference_answer} />
         </div>

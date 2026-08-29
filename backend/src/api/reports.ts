@@ -109,6 +109,41 @@ router.get('/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   }
 });
 
+// GET /api/reports/answers/:answerId/photo/:idx
+// Streams a student's uploaded photo through the backend so the frontend can show
+// it same-origin (prod CSP allows only 'self' images) without persisting anything.
+router.get('/answers/:answerId/photo/:idx', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const idx = parseInt(req.params.idx, 10);
+    if (!Number.isInteger(idx) || idx < 0) { res.status(400).end(); return; }
+
+    const result = await db.query(
+      `SELECT a.student_answer_structured
+       FROM answers a
+       JOIN student_sessions ss ON ss.id = a.session_id
+       WHERE a.id = $1 AND ss.teacher_id = $2`,
+      [req.params.answerId, req.teacherId],
+    );
+    const structured: any = result.rows[0]?.student_answer_structured ?? null;
+    const photos: any[] = Array.isArray(structured?.photos) ? structured.photos : [];
+    const url: string | undefined = photos[idx]?.url;
+    if (!url || !/^https?:\/\//i.test(url)) { res.status(404).end(); return; }
+
+    const upstream = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+    if (!upstream.ok) { res.status(502).end(); return; }
+
+    let ct = (upstream.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (!ct.startsWith('image/')) ct = 'image/jpeg';
+    const buf = Buffer.from(await upstream.arrayBuffer());
+
+    res.setHeader('Content-Type', ct);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.end(buf);
+  } catch (err: any) {
+    res.status(504).end();
+  }
+});
+
 // PATCH /api/reports/answers/:answerId/override
 const overrideSchema = z.object({
   score: z.number().int().min(0),

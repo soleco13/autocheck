@@ -2,7 +2,7 @@ import { db } from '../db';
 
 export interface ParsedTask {
   componentId: string;
-  taskType: 'check_value' | 'open_answer' | 'matches' | 'input' | 'quiz' | 'fill_blanks';
+  taskType: 'check_value' | 'open_answer' | 'matches' | 'input' | 'quiz' | 'fill_blanks' | 'photo_answer';
   questionText: string;
   studentAnswer: string | null;
   studentAnswerStructured: any | null;
@@ -224,6 +224,50 @@ function buildCorrectAnswerMap(baseState: any): Map<string, string[]> {
 }
 
 // Builds mapping: CInput.id (type 14) → parent AnswerInput slideObject id
+export interface StudentPhoto {
+  url: string;
+  name?: string;
+  type?: string;
+}
+
+// Student photo uploads live in a CFileLoader component whose file list is a
+// `gsecuredValue` named `filesInternal` → serialized under `rawState.securedVars`
+// (same container as `{compId}result`) keyed as `{compId}filesInternal`.
+// Shape: { [fileId]: { id, name, type, size, ts, data: { status, fileId, src } } }.
+// We only keep files that finished uploading (status === 'ok').
+function buildPhotoMap(rawState: any): Map<string, StudentPhoto[]> {
+  const out = new Map<string, StudentPhoto[]>();
+  const buckets = [
+    rawState?.securedVars,
+    rawState?.vars?.secured,
+    rawState?.vars?.owned,
+    rawState?.vars?.shared,
+  ].filter((b) => b && typeof b === 'object');
+
+  for (const bucket of buckets) {
+    for (const [key, value] of Object.entries(bucket as Record<string, any>)) {
+      if (!key.endsWith('filesInternal') || !value || typeof value !== 'object') continue;
+      const compId = key.slice(0, -'filesInternal'.length);
+      const files: StudentPhoto[] = Object.values(value)
+        .filter((f: any) => {
+          const st = f?.data?.status ?? f?.status;
+          return (st === 'ok' || st === undefined) && (f?.data?.src || f?.data?.url || f?.src);
+        })
+        .map((f: any) => ({
+          url: String(f?.data?.src || f?.data?.url || f?.src),
+          name: typeof f?.name === 'string' ? f.name : undefined,
+          type: typeof f?.type === 'string' ? f.type : undefined,
+        }))
+        .filter((p) => /^https?:\/\//i.test(p.url));
+      if (files.length > 0) {
+        const prev = out.get(compId) ?? [];
+        out.set(compId, [...prev, ...files]);
+      }
+    }
+  }
+  return out;
+}
+
 function buildCInputToAnswerInputMap(baseState: any): Map<string, string> {
   const result = new Map<string, string>();
   const map: Record<string, any> = baseState?.__meta?.map;
@@ -262,12 +306,13 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
 
   const correctAnswerMap = buildCorrectAnswerMap(rawState.baseState);
   const cInputToAnswerInput = buildCInputToAnswerInputMap(rawState.baseState);
+  const photoMap = buildPhotoMap(rawState);
 
   try {
     // Use Function constructor to bypass TypeScript's import()->require() transformation
     // @itgenio/edik-core is ESM; dynamic require() fails for it
     const _dynImport = new Function('pkg', 'return import(pkg)');
-    const { Parser, CInput, CText, CImage } = await _dynImport('@itgenio/edik-core');
+    const { Parser, CInput, CText, CImage, CFileLoader } = await _dynImport('@itgenio/edik-core');
     const material = await Parser.deserializeMaterial(rawState.baseState);
     const tasks: ParsedTask[] = [];
 
@@ -296,6 +341,8 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
     const processedDropdownSuffixes = new Set<string>();
     // Deduplicate CInput — same component may appear multiple times in traversal
     const processedCInputIds = new Set<string>();
+    // Deduplicate CFileLoader (photo answer) components
+    const processedFileLoaderIds = new Set<string>();
 
     for (let slideIdx = 0; slideIdx < material.slides.length; slideIdx++) {
       const slide = material.slides[slideIdx];
@@ -313,6 +360,40 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
         const allObjs: any[] = [rootObj, ...rootObj.getDeepChildren()];
 
         for (const obj of allObjs) {
+          // Photo answer: student attached photo(s) of their handwritten solution
+          // via a CFileLoader component. Grade later with the vision model.
+          const fileLoaderComp = CFileLoader ? obj.getComponent(CFileLoader) : null;
+          if (fileLoaderComp) {
+            const flId = fileLoaderComp.id;
+            if (!processedFileLoaderIds.has(flId)) {
+              processedFileLoaderIds.add(flId);
+              const photos = photoMap.get(flId) ?? [];
+              const ctx = getSlideContext(slide, null, CText);
+              let hint = getQuestionText(obj, CText);
+              if (hint && GENERIC_LABELS.has(hint.toLowerCase().trim())) hint = '';
+              let questionText = ctx.problem;
+              if (hint && hint !== ctx.problem && !ctx.problem.includes(hint)) {
+                questionText = ctx.problem ? `${ctx.problem}\n${hint}` : hint;
+              }
+              tasks.push({
+                componentId: flId,
+                taskType: 'photo_answer',
+                questionText,
+                studentAnswer: photos.length > 0 ? `[прикреплено фото: ${photos.length}]` : null,
+                studentAnswerStructured: {
+                  photos,
+                  _slideNum: slideNum,
+                  _slideProblem: ctx.problem || null,
+                  _instruction: ctx.instruction || null,
+                  _answerKey: ctx.answerKey || null,
+                  _criteria: ctx.criteria || null,
+                },
+                correctAnswer: null,
+              });
+            }
+            continue;
+          }
+
           const inputComp = obj.getComponent(CInput);
           if (inputComp) {
             const inputId = inputComp.id;
@@ -546,6 +627,21 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
       }
     }
 
+    // Reconcile: any photo upload present in the session state whose CFileLoader
+    // wasn't reached by the slide traversal still gets a task (no slide context).
+    for (const [compId, photos] of photoMap) {
+      if (processedFileLoaderIds.has(compId)) continue;
+      processedFileLoaderIds.add(compId);
+      tasks.push({
+        componentId: compId,
+        taskType: 'photo_answer',
+        questionText: '',
+        studentAnswer: photos.length > 0 ? `[прикреплено фото: ${photos.length}]` : null,
+        studentAnswerStructured: { photos },
+        correctAnswer: null,
+      });
+    }
+
     // Annotate tasks that share the same question_text on the same slide so the AI
     // checker knows "this is part N of M" and doesn't expect a full compound answer.
     const groupCounts = new Map<string, number>();
@@ -713,6 +809,18 @@ function parseRawStateFallback(
         correctVariants: ownedVars[compId + 'savedVariants'] || [],
         _isSolved: secResult?.isSolved ?? null,
       },
+      correctAnswer: null,
+    });
+  }
+
+  // Strategy 6: photo answers (CFileLoader filesInternal in securedVars)
+  for (const [compId, photos] of buildPhotoMap(rawState)) {
+    tasks.push({
+      componentId: compId,
+      taskType: 'photo_answer',
+      questionText: findQuestionTextForComp(compId),
+      studentAnswer: photos.length > 0 ? `[прикреплено фото: ${photos.length}]` : null,
+      studentAnswerStructured: { photos },
       correctAnswer: null,
     });
   }

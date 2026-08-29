@@ -4,11 +4,17 @@ import { db } from '../db';
 import { aiThrottle } from '../lib/ai-throttle';
 import { DEFAULT_PROMPTS } from '../api/settings';
 import { configStore } from '../lib/config-store';
-import { getOpenRouterClient } from '../lib/openrouter-client';
+import { getOpenRouterClient, getOpenRouterVisionClient } from '../lib/openrouter-client';
 import { retrieveChunks, checkRagAvailability, checkRagStatus } from './rag-retriever';
 
 const CHECKER_MODEL  = process.env.AI_CHECKER_MODEL  || 'anthropic/claude-haiku-4.5';
 const FALLBACK_MODEL = process.env.AI_FALLBACK_MODEL || 'openai/gpt-5-mini';
+const VISION_MODEL   = (process.env.AI_VISION_MODEL || '').trim();
+
+// Guards for downloading student photos before sending them to the vision model.
+const PHOTO_MAX_COUNT = 6;
+const PHOTO_MAX_BYTES = 12 * 1024 * 1024;
+const PHOTO_FETCH_TIMEOUT_MS = 20_000;
 
 // ── Primary-model circuit breaker ─────────────────────────────────────────────
 // After 2 consecutive transient failures, skip the primary model for 5 min and go
@@ -441,6 +447,228 @@ const WORD_TO_NUM: Record<string, number> = {
   девять: 9, девяти: 9, десять: 10, десяти: 10,
 };
 
+// ── Photo answer checker (vision model) ──────────────────────────────────────
+// Student attached photo(s) of a handwritten solution (CFileLoader task).
+// We download each photo in-memory, send it to the multimodal model, and store
+// the verdict on the answer row exactly like the text checker — so the Claude
+// report generator picks up score + feedback with no extra wiring.
+async function fetchPhotoAsDataUrl(url: string): Promise<{ dataUrl: string; sha: string } | null> {
+  let resp: Awaited<ReturnType<typeof fetch>>;
+  try {
+    resp = await fetch(url, { signal: AbortSignal.timeout(PHOTO_FETCH_TIMEOUT_MS) });
+  } catch (err: any) {
+    console.warn(`[photo-checker] fetch failed for photo: ${err?.message}`);
+    return null;
+  }
+  if (!resp.ok) {
+    console.warn(`[photo-checker] photo HTTP ${resp.status}`);
+    return null;
+  }
+  const buf = Buffer.from(await resp.arrayBuffer());
+  if (buf.length === 0 || buf.length > PHOTO_MAX_BYTES) {
+    console.warn(`[photo-checker] photo size out of range: ${buf.length} bytes`);
+    return null;
+  }
+  let ct = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  if (!ct.startsWith('image/')) {
+    // Some file stores serve images as octet-stream — infer from magic bytes.
+    if (buf[0] === 0xff && buf[1] === 0xd8) ct = 'image/jpeg';
+    else if (buf[0] === 0x89 && buf[1] === 0x50) ct = 'image/png';
+    else if (buf[0] === 0x52 && buf[1] === 0x49) ct = 'image/webp';
+    else ct = 'image/jpeg';
+  }
+  const sha = crypto.createHash('sha256').update(buf).digest('hex');
+  return { dataUrl: `data:${ct};base64,${buf.toString('base64')}`, sha };
+}
+
+async function setAnswerResult(
+  answerId: string,
+  status: CheckResult['status'],
+  score: number,
+  feedbackStudent: string,
+  feedbackTeacher: string,
+): Promise<void> {
+  await db.query(
+    `UPDATE answers SET status = $1, score = $2, ai_feedback = $3, ai_teacher_note = $4 WHERE id = $5`,
+    [status, score, feedbackStudent, feedbackTeacher, answerId],
+  );
+}
+
+export async function checkPhotoAnswer(answerId: string): Promise<void> {
+  const r = await db.query(
+    `SELECT a.student_answer_structured,
+            t.question_text, t.max_score AS task_max_score,
+            cs.grade, cs.subject_code, cs.topic,
+            ss.teacher_id
+     FROM answers a
+     JOIN tasks t ON t.id = a.task_id
+     JOIN control_sheets cs ON cs.id = t.control_sheet_id
+     JOIN student_sessions ss ON ss.id = a.session_id
+     WHERE a.id = $1`,
+    [answerId],
+  );
+  if (!r.rows[0]) return;
+  const row = r.rows[0];
+  const raw = row.student_answer_structured;
+  const structured: any = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : null;
+  const photos: Array<{ url: string; name?: string }> = Array.isArray(structured?.photos) ? structured.photos : [];
+
+  // No photo attached — treat like an empty answer.
+  if (photos.length === 0) {
+    await setAnswerResult(answerId, 'incorrect', 0,
+      'Фото решения не прикреплено.',
+      'Ученик не приложил фото к заданию.');
+    return;
+  }
+
+  // Vision model not configured — leave for manual review.
+  if (!VISION_MODEL) {
+    await setAnswerResult(answerId, 'manual_required', 0,
+      'Требуется ручная проверка фото.',
+      'Автопроверка фото не настроена (AI_VISION_MODEL не задан).');
+    return;
+  }
+
+  const questionText: string = row.question_text || structured?._slideProblem || '';
+  const criteria: string = structured?._criteria || '';
+  const answerKey: string = structured?._answerKey || '';
+  const instruction: string = structured?._instruction || '';
+  const grade: number = row.grade || 0;
+  const subjectCode: string = row.subject_code || '';
+  const maxScore: number = row.task_max_score || 1;
+
+  try {
+    // Download photos (in-memory only — never persisted).
+    const downloaded: Array<{ dataUrl: string; sha: string }> = [];
+    for (const p of photos.slice(0, PHOTO_MAX_COUNT)) {
+      const img = await fetchPhotoAsDataUrl(p.url);
+      if (img) downloaded.push(img);
+    }
+
+    if (downloaded.length === 0) {
+      await setAnswerResult(answerId, 'manual_required', 0,
+        'Не удалось загрузить фото для автоматической проверки.',
+        'Фото ученика недоступно по ссылке платформы — проверьте вручную в интерфейсе платформы.');
+      return;
+    }
+
+    // Answer-level cache keyed by task text + photo content hashes.
+    // Version tag ('photo-v2') — bump when prompt / scoring logic changes so stale
+    // entries from an older format are not served.
+    const cacheKey = crypto.createHash('sha256').update([
+      'photo-v2',
+      questionText.trim(),
+      criteria.trim(),
+      answerKey.trim(),
+      downloaded.map(d => d.sha).sort().join('|'),
+      String(configStore.get('rag_mode')),
+    ].join('\x00')).digest('hex');
+
+    const cached = await getCached(cacheKey);
+    if (cached) {
+      // Re-derive status from the cached (rounded) score against this task's
+      // max_score so it stays consistent even if the cache predates that rule.
+      const cs = Math.max(0, Math.min(maxScore, cached.score ?? 0));
+      const cStatus: CheckResult['status'] = cs <= 0 ? 'incorrect' : cs >= maxScore ? 'correct' : 'partial';
+      await setAnswerResult(answerId, cStatus, cs,
+        cached.feedbackForStudent, cached.feedbackForTeacher);
+      return;
+    }
+
+    const systemPrompt = await getTeacherPrompt(row.teacher_id ?? null, 'checker_vision_system');
+
+    const gradeStr = grade > 0 ? `${grade} класс` : '';
+    const subjectStr = subjectCode && subjectCode !== 'XX' ? subjectCode : '';
+    const contextLine = [subjectStr, gradeStr, row.topic && row.topic !== 'Unknown' ? `тема: ${row.topic}` : '']
+      .filter(Boolean).join(', ');
+    const hasReference = criteria.trim() !== '' || answerKey.trim() !== '';
+
+    const lines: string[] = [];
+    if (contextLine) lines.push(contextLine + '.');
+    lines.push(`Задание: ${questionText || '(текст задания отсутствует, оцени по фото)'}`);
+    if (instruction) lines.push(`Требование к оформлению: ${instruction}`);
+    if (criteria) lines.push(`Критерии оценивания: ${criteria}`);
+    if (answerKey) lines.push(`Эталонный ответ: ${answerKey}`);
+    lines.push(`Максимальный балл за задание: ${maxScore}.`);
+    lines.push(`К заданию прикреплено фото (${downloaded.length} шт.) с рукописным решением ученика. Внимательно разбери решение на фото: ход рассуждений, вычисления, итоговый ответ.`);
+    lines.push(hasReference
+      ? `Верни ТОЛЬКО JSON без markdown: {"score": число от 0 до ${maxScore} (можно дробное), "correct": true/false, "feedback_student": "краткий разбор для ученика", "feedback_teacher": "заметка для учителя: что именно на фото верно/неверно"}`
+      : `Верни ТОЛЬКО JSON без markdown: {"score": число от 0 до ${maxScore} (можно дробное), "feedback_student": "краткий разбор для ученика", "feedback_teacher": "заметка для учителя: что именно на фото верно/неверно"}`);
+
+    const userContent: any[] = [{ type: 'text', text: lines.join('\n') }];
+    for (const img of downloaded) {
+      userContent.push({ type: 'image_url', image_url: { url: img.dataUrl } });
+    }
+
+    await aiThrottle.acquire();
+    const client = getOpenRouterVisionClient();
+    const response = await client.chat.completions.create({
+      model: VISION_MODEL,
+      max_tokens: 1500,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userContent },
+      ],
+    });
+    const text = response.choices[0]?.message?.content ?? '';
+    const usage = {
+      input_tokens: response.usage?.prompt_tokens ?? 0,
+      output_tokens: response.usage?.completion_tokens ?? 0,
+    };
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(extractJSON(text, '{'));
+    } catch {
+      await setAnswerResult(answerId, 'manual_required', 0,
+        'ИИ не смог разобрать фото — нужна ручная проверка.',
+        `Ответ vision-модели не распознан как JSON: ${text.slice(0, 200)}`);
+      return;
+    }
+
+    const scoreRaw: number = typeof parsed.score === 'number'
+      ? parsed.score
+      : (parsed.correct === true ? maxScore : 0);
+    const scoreClamped = Math.max(0, Math.min(maxScore, scoreRaw));
+    // answers.score is an INT column — round, then derive status from that same
+    // rounded score so the two never disagree (no "partial" next to a full 1/1 pill
+    // on a binary task). Nuance for near-misses lives in the feedback text; the
+    // teacher can still override.
+    const score = Math.round(scoreClamped);
+    const status: CheckResult['status'] =
+      score <= 0 ? 'incorrect' : score >= maxScore ? 'correct' : 'partial';
+
+    const result: CheckResultWithUsage = {
+      status,
+      score,
+      maxScore,
+      feedbackForStudent: parsed.feedback_student || (status === 'correct' ? 'Верно!' : 'Есть ошибки, посмотри разбор.'),
+      feedbackForTeacher: parsed.feedback_teacher || '',
+      usage,
+    };
+
+    await setAnswerResult(answerId, result.status, result.score,
+      result.feedbackForStudent, result.feedbackForTeacher);
+    setCached(cacheKey, result).catch(() => {});
+
+    db.query(
+      `INSERT INTO ai_call_log (answer_id, teacher_id, model, prompt_tokens, completion_tokens)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [answerId, row.teacher_id, VISION_MODEL, usage.input_tokens, usage.output_tokens],
+    ).catch(() => {});
+  } catch (err: any) {
+    console.error('[photo-checker] Error:', err?.message);
+    await db.query(
+      `UPDATE answers
+       SET status = CASE WHEN status IN ('correct','partial','incorrect') THEN status ELSE 'manual_required' END,
+           score  = CASE WHEN status IN ('correct','partial','incorrect') THEN score  ELSE 0 END,
+           ai_teacher_note = $2
+       WHERE id = $1`,
+      [answerId, `Vision-модель недоступна: ${String(err?.message).slice(0, 120)}`],
+    ).catch(() => {});
+  }
+}
+
 export async function checkAnswer(answerId: string): Promise<void> {
   const answerResult = await db.query(`
     SELECT a.*, t.task_type, t.question_text, t.reference_answer,
@@ -455,6 +683,12 @@ export async function checkAnswer(answerId: string): Promise<void> {
 
   if (!answerResult.rows[0]) return;
   const answer = answerResult.rows[0];
+
+  // Photo answer — grade with the vision model.
+  if (answer.task_type === 'photo_answer') {
+    await checkPhotoAnswer(answerId);
+    return;
+  }
 
   // Empty answer
   if (!answer.student_answer && !answer.student_answer_structured) {
@@ -858,6 +1092,13 @@ export async function checkAnswersBatch(
     // Structured types: delegate to individual checkAnswer (deterministic, no AI)
     if (['matches', 'quiz', 'fill_blanks'].includes(answer.task_type)) {
       await checkAnswer(answer.id).catch(() => {}); progress(); continue;
+    }
+
+    // Photo answers: separate multimodal call, can't be batched with text tasks.
+    if (answer.task_type === 'photo_answer') {
+      await checkPhotoAnswer(answer.id).catch((e) =>
+        console.error('[batch-checker] photo check failed', answer.id, e?.message));
+      progress(); continue;
     }
 
     const studentAnswer = answer.student_answer || '';

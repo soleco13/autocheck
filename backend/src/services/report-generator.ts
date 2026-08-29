@@ -86,17 +86,34 @@ export async function generateReport(sessionId: string): Promise<string> {
 
       const correctCount = answers.filter((a: any) => a.status === 'correct').length;
 
+      // Per-answer verdicts from the checkers (text checker + vision model for photo
+      // tasks) — pass the notable ones through so the report summary reflects what
+      // was actually found in each answer, not just the aggregate score.
+      const issueLines = answers
+        .filter((a: any) => ['incorrect', 'partial', 'manual_required'].includes(a.status))
+        .slice(0, 12)
+        .map((a: any, i: number) => {
+          const q = (a.question_text || '').replace(/\s+/g, ' ').trim().slice(0, 90);
+          const fb = (a.ai_feedback || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+          const tag = a.task_type === 'photo_answer' ? ' (фото)' : '';
+          return `${i + 1}. [${a.status}]${tag} ${q}${fb ? ` — ${fb}` : ''}`;
+        })
+        .join('\n');
+      const issuesBlock = issueLines ? `\n\nПроблемные задания:\n${issueLines}` : '';
+
       const summaryPrompt =
         `${studentPromptBase}\n\n` +
         `Ученик: ${session.grade} класс. Работа: «${session.topic}». ` +
-        `Оценка: ${grade} (${percentage.toFixed(0)}%). Верных заданий: ${correctCount} из ${answers.length}.`;
+        `Оценка: ${grade} (${percentage.toFixed(0)}%). Верных заданий: ${correctCount} из ${answers.length}.` +
+        issuesBlock;
 
       const teacherSummaryPrompt =
         `${teacherPromptBase}\n\n` +
         `Ученик: ${session.grade} класс. Тема: «${session.topic}». ` +
         `Оценка: ${grade} (${percentage.toFixed(0)}%). ` +
         `Верных: ${correctCount}/${answers.length}. ` +
-        `Неверных: ${answers.filter((a: any) => a.status === 'incorrect').length}.`;
+        `Неверных: ${answers.filter((a: any) => a.status === 'incorrect').length}.` +
+        issuesBlock;
 
       // Throttle both calls (2 slots) before firing — prevents 429 cascade under bulk load.
       await aiThrottle.acquire();
