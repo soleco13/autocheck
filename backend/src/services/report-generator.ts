@@ -5,13 +5,13 @@ import { getTeacherPrompt, callGPTFallback, isCircuitOpen } from './ai-checker';
 
 const MODEL = process.env.AI_REPORT_MODEL || process.env.AI_CHECKER_MODEL || 'anthropic/claude-sonnet-5';
 
-async function callReportAI(userPrompt: string): Promise<string> {
+async function callReportAI(userPrompt: string, maxTokens = 1200): Promise<string> {
   if (!isCircuitOpen()) {
     try {
       const client = getOpenRouterClient();
       const response = await client.chat.completions.create({
         model: MODEL,
-        max_tokens: 1200,
+        max_tokens: maxTokens,
         messages: [{ role: 'user', content: userPrompt }],
       });
       return response.choices[0]?.message?.content ?? '';
@@ -25,8 +25,30 @@ async function callReportAI(userPrompt: string): Promise<string> {
       console.warn(`[report-generator] ${MODEL} unavailable, using fallback`);
     }
   }
-  return callGPTFallback(userPrompt, 'Ты помощник учителя. Отвечай кратко и по-русски.', 1200);
+  return callGPTFallback(userPrompt, 'Ты помощник учителя. Отвечай по-русски.', maxTokens);
 }
+
+const STATUS_RU: Record<string, string> = {
+  correct: 'верно',
+  incorrect: 'ошибка',
+  partial: 'частично верно',
+  manual_required: 'нужна проверка учителя',
+  not_answered: 'нет ответа',
+  skipped: 'пропущено',
+};
+
+const clean = (s: any, n: number): string =>
+  String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, n);
+
+const TASK_TYPE_RU: Record<string, string> = {
+  check_value: 'задание с кратким ответом',
+  open_answer: 'задание с развёрнутым ответом',
+  matches: 'задание на сопоставление',
+  input: 'задание с вводом ответа',
+  quiz: 'тест с выбором варианта',
+  fill_blanks: 'задание на заполнение пропусков',
+  photo_answer: 'задание с фото рукописного решения',
+};
 
 function scoreToGrade(percentage: number): string {
   if (percentage >= 85) return '5';
@@ -37,11 +59,13 @@ function scoreToGrade(percentage: number): string {
 
 export async function generateReport(sessionId: string): Promise<string> {
   const answersResult = await db.query(`
-    SELECT a.score, a.status, a.ai_feedback, a.student_answer,
-           t.question_text, t.max_score, t.task_type
+    SELECT a.score, a.status, a.ai_feedback, a.ai_teacher_note, a.student_answer,
+           a.teacher_override_score,
+           t.question_text, t.max_score, t.task_type, t.task_index, t.reference_answer
     FROM answers a
     JOIN tasks t ON t.id = a.task_id
     WHERE a.session_id = $1
+    ORDER BY t.task_index ASC NULLS LAST, a.created_at ASC
   `, [sessionId]);
 
   const sessionResult = await db.query(`
@@ -86,41 +110,55 @@ export async function generateReport(sessionId: string): Promise<string> {
 
       const correctCount = answers.filter((a: any) => a.status === 'correct').length;
 
-      // Per-answer verdicts from the checkers (text checker + vision model for photo
-      // tasks) — pass the notable ones through so the report summary reflects what
-      // was actually found in each answer, not just the aggregate score.
-      const issueLines = answers
-        .filter((a: any) => ['incorrect', 'partial', 'manual_required'].includes(a.status))
-        .slice(0, 12)
+      // Full per-task breakdown — every task, in order, with the student's answer,
+      // the reference answer and the checker's verdict (text checker + vision model
+      // for photo tasks). This is the raw material the report model turns into a
+      // detailed, task-by-task feedback for the student.
+      const taskBreakdown = answers
         .map((a: any, i: number) => {
-          const q = (a.question_text || '').replace(/\s+/g, ' ').trim().slice(0, 90);
-          const fb = (a.ai_feedback || '').replace(/\s+/g, ' ').trim().slice(0, 180);
-          const tag = a.task_type === 'photo_answer' ? ' (фото)' : '';
-          return `${i + 1}. [${a.status}]${tag} ${q}${fb ? ` — ${fb}` : ''}`;
+          const num = a.task_index != null ? a.task_index + 1 : i + 1;
+          const eff = a.teacher_override_score != null ? a.teacher_override_score : a.score;
+          const typeRu = TASK_TYPE_RU[a.task_type] || a.task_type || 'задание';
+          const lines = [
+            `Задание ${num} — ${typeRu}. Результат: ${STATUS_RU[a.status] || a.status}, балл ${eff ?? 0} из ${a.max_score || 1}`,
+            `  Условие: ${clean(a.question_text, 600) || '—'}`,
+            `  Ответ ученика: ${clean(a.student_answer, 400) || '—'}`,
+          ];
+          if (a.reference_answer) lines.push(`  Эталонный ответ: ${clean(a.reference_answer, 400)}`);
+          if (a.ai_feedback) lines.push(`  Что показала проверка: ${clean(a.ai_feedback, 700)}`);
+          if (a.ai_teacher_note) lines.push(`  Заметка для учителя: ${clean(a.ai_teacher_note, 500)}`);
+          return lines.join('\n');
         })
-        .join('\n');
-      const issuesBlock = issueLines ? `\n\nПроблемные задания:\n${issueLines}` : '';
+        .join('\n\n');
+
+      const incorrectCount = answers.filter((a: any) => a.status === 'incorrect').length;
+      const partialCount = answers.filter((a: any) => a.status === 'partial').length;
+      const manualCount = answers.filter((a: any) => a.status === 'manual_required').length;
+
+      const commonContext =
+        `Класс: ${session.grade}. Предмет: ${session.subject_name || session.subject_code || '—'}. ` +
+        `Тема: «${session.topic || session.title}».\n` +
+        `Верных заданий ${correctCount} из ${answers.length} ` +
+        `(с ошибкой: ${incorrectCount}, частично: ${partialCount}, требуют ручной проверки: ${manualCount}). ` +
+        `Выполнено на ${percentage.toFixed(0)}%.`;
+
+      const studentContext = `КОНТЕКСТ РАБОТЫ\n${commonContext}`;
+      const teacherContext = `КОНТЕКСТ РАБОТЫ\n${commonContext} Предварительная оценка: ${grade}.`;
 
       const summaryPrompt =
-        `${studentPromptBase}\n\n` +
-        `Ученик: ${session.grade} класс. Работа: «${session.topic}». ` +
-        `Оценка: ${grade} (${percentage.toFixed(0)}%). Верных заданий: ${correctCount} из ${answers.length}.` +
-        issuesBlock;
+        `${studentPromptBase}\n\n${studentContext}\n\n` +
+        `РАЗБОР ПО ЗАДАНИЯМ (это исходные данные для тебя — опирайся только на них):\n\n${taskBreakdown}`;
 
       const teacherSummaryPrompt =
-        `${teacherPromptBase}\n\n` +
-        `Ученик: ${session.grade} класс. Тема: «${session.topic}». ` +
-        `Оценка: ${grade} (${percentage.toFixed(0)}%). ` +
-        `Верных: ${correctCount}/${answers.length}. ` +
-        `Неверных: ${answers.filter((a: any) => a.status === 'incorrect').length}.` +
-        issuesBlock;
+        `${teacherPromptBase}\n\n${teacherContext}\n\n` +
+        `РАЗБОР ПО ЗАДАНИЯМ:\n\n${taskBreakdown}`;
 
       // Throttle both calls (2 slots) before firing — prevents 429 cascade under bulk load.
       await aiThrottle.acquire();
       await aiThrottle.acquire();
       const [studentText, teacherText] = await Promise.all([
-        callReportAI(summaryPrompt),
-        callReportAI(teacherSummaryPrompt),
+        callReportAI(summaryPrompt, 700),
+        callReportAI(teacherSummaryPrompt, 550),
       ]);
       aiSummaryForStudent = studentText;
       aiSummaryForTeacher = teacherText;

@@ -509,6 +509,7 @@ export default function Report() {
   const [overrides, setOverrides] = useState<Record<string, number>>({})
   const [filter, setFilter] = useState<'all' | 'attention' | 'correct'>('all')
   const [flashId, setFlashId] = useState<string | null>(null)
+  const [openSummary, setOpenSummary] = useState<{ student: boolean; teacher: boolean }>({ student: false, teacher: false })
   const refs = useRef<Record<string, HTMLElement | null>>({})
 
   const [pollExpired, setPollExpired] = useState(false)
@@ -629,6 +630,37 @@ export default function Report() {
   })).filter(s => s.items.length > 0)
 
   const initials = (report.student_name || '?').split(' ').map((w: string) => w[0]).slice(0, 2).join('')
+
+  const SummaryCard = ({ which, text, label, icon, c, bg, bd, iconBg }: {
+    which: 'student' | 'teacher'; text: string; label: string; icon: React.ReactNode
+    c: string; bg: string; bd: string; iconBg: string
+  }) => {
+    const open = openSummary[which]
+    const long = text.trim().length > 240
+    return (
+      <div style={{ display: 'flex', gap: 11, alignItems: 'flex-start', padding: '15px 17px', background: bg, borderRadius: 14, border: `1px solid ${bd}` }}>
+        <span style={{ width: 34, height: 34, borderRadius: 9, background: iconBg, color: c, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>{icon}</span>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontSize: 11.5, fontWeight: 700, color: c, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 4 }}>{label}</div>
+          <div style={{
+            fontSize: 14, color: 'var(--c-text-2)', lineHeight: 1.6, margin: 0, whiteSpace: 'pre-line',
+            ...(long && !open ? { display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical' as const, overflow: 'hidden' } : {}),
+          }}>
+            <MathText>{text}</MathText>
+          </div>
+          {long && (
+            <button
+              onClick={() => setOpenSummary(p => ({ ...p, [which]: !p[which] }))}
+              style={{ marginTop: 7, display: 'inline-flex', alignItems: 'center', gap: 4, background: 'none', border: 'none', padding: 0, cursor: 'pointer', color: c, fontSize: 12.5, fontWeight: 600 }}
+            >
+              {open ? 'Свернуть' : 'Развернуть'}
+              <ChevronDown size={14} style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }} />
+            </button>
+          )}
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="fade-in" style={{ width: '100%' }}>
@@ -761,24 +793,14 @@ export default function Report() {
 
         {/* AI summaries */}
         {(report.ai_summary_for_student || report.ai_summary_for_teacher) && (
-          <div style={{ display: 'grid', gridTemplateColumns: report.ai_summary_for_student && report.ai_summary_for_teacher ? '1fr 1fr' : '1fr', gap: 14, marginBottom: 14 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 14 }}>
             {report.ai_summary_for_student && (
-              <div style={{ display: 'flex', gap: 11, alignItems: 'flex-start', padding: '15px 17px', background: '#1d4ed80d', borderRadius: 14, border: '1px solid #1d4ed822' }}>
-                <span style={{ width: 34, height: 34, borderRadius: 9, background: '#1d4ed81a', color: 'var(--c-primary)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}><MessageSquare size={17} /></span>
-                <div>
-                  <div style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--c-primary)', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 4 }}>Обратная связь ученику</div>
-                  <p style={{ fontSize: 14, color: 'var(--c-text-2)', lineHeight: 1.55, margin: 0 }}>{report.ai_summary_for_student}</p>
-                </div>
-              </div>
+              <SummaryCard which="student" text={report.ai_summary_for_student} label="Обратная связь ученику"
+                icon={<MessageSquare size={17} />} c="var(--c-primary)" bg="#1d4ed80d" bd="#1d4ed822" iconBg="#1d4ed81a" />
             )}
             {report.ai_summary_for_teacher && (
-              <div style={{ display: 'flex', gap: 11, alignItems: 'flex-start', padding: '15px 17px', background: '#0d94880d', borderRadius: 14, border: '1px solid #0d948822' }}>
-                <span style={{ width: 34, height: 34, borderRadius: 9, background: '#0d94881a', color: 'var(--c-teal)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}><BookOpen size={17} /></span>
-                <div>
-                  <div style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--c-teal)', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 4 }}>Рекомендации учителю</div>
-                  <p style={{ fontSize: 14, color: 'var(--c-text-2)', lineHeight: 1.55, margin: 0 }}>{report.ai_summary_for_teacher}</p>
-                </div>
-              </div>
+              <SummaryCard which="teacher" text={report.ai_summary_for_teacher} label="Рекомендации учителю"
+                icon={<BookOpen size={17} />} c="var(--c-teal)" bg="#0d94880d" bd="#0d948822" iconBg="#0d94881a" />
             )}
           </div>
         )}
