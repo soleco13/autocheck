@@ -18,6 +18,23 @@ function worksCacheKey(teacherId: string, studentId: string): string {
   return `works:${teacherId}:${studentId}`;
 }
 
+/**
+ * Момент выдачи материала ученику — вытаскивается из activity платформы:
+ * сначала первое событие sendToChild (from:false→to:true), затем первое
+ * changeStatus из notStarted, затем самое раннее событие вообще.
+ * Возвращает ISO-строку или null, если activity пуст.
+ */
+function extractAssignedAt(m: any): string | null {
+  const activity: any[] = Array.isArray(m?.activity) ? m.activity : [];
+  if (activity.length === 0) return null;
+  const sent = activity.find((a: any) => a.t === 'sendToChild' && a.d?.to === true);
+  if (sent?.ts) return sent.ts;
+  const started = activity.find((a: any) => a.t === 'changeStatus' && a.d?.from === 'notStarted');
+  if (started?.ts) return started.ts;
+  const earliest = activity.map((a: any) => a.ts).filter(Boolean).sort()[0];
+  return earliest || null;
+}
+
 // GET /api/students?sync=true&search=...&page=1&pageSize=50
 router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   if (req.query.sync === 'true') {
@@ -128,12 +145,14 @@ router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) =>
 
     let platformExtras: any[] = [];
     let platformError: string | null = null;
+    // materialId → ISO-дата выдачи ученику (из activity платформы)
+    let assignedAtMap: Record<string, string> = {};
 
     // Redis cache for platform data — survives restarts and shared across processes
     const cacheKey = worksCacheKey(req.teacherId!, req.params.id);
     if (!forceRefresh) {
-      const hit = await cacheGet<{ extras: any[]; error: string | null }>(cacheKey);
-      if (hit) { platformExtras = hit.extras; platformError = hit.error; }
+      const hit = await cacheGet<{ extras: any[]; error: string | null; assignedAt?: Record<string, string> }>(cacheKey);
+      if (hit) { platformExtras = hit.extras; platformError = hit.error; assignedAtMap = hit.assignedAt ?? {}; }
     }
     if (forceRefresh || (platformExtras.length === 0 && !platformError))
     try {
@@ -157,6 +176,16 @@ router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) =>
 
           if (materials.length === 0) {
             platformError = 'Не удалось загрузить материалы с платформы (сервер временно недоступен)';
+          }
+
+          // Дата выдачи — по ВСЕМ материалам (в т.ч. уже проверенным),
+          // чтобы сортировать всю карточку, а не только непроверенные работы.
+          assignedAtMap = {};
+          for (const m of materials) {
+            const mid = m.materialId || m._id;
+            if (!mid) continue;
+            const at = extractAssignedAt(m);
+            if (at) assignedAtMap[mid] = at;
           }
 
           // New format: [{materialId, activity, interactiveData, status}]
@@ -186,6 +215,7 @@ router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) =>
               percentage: null,
               trainer_token: trainerToken,
               platform_status: platformStatus,
+              assigned_at: assignedAtMap[mid] ?? null,
             };
           });
         }
@@ -196,9 +226,18 @@ router.get('/:id/works', requireAuth, async (req: AuthRequest, res: Response) =>
     }
 
     // Store in Redis cache (even errors, to avoid hammering the platform)
-    await cacheSet(cacheKey, { extras: platformExtras, error: platformError }, getWorksTtlSeconds());
+    await cacheSet(cacheKey, { extras: platformExtras, error: platformError, assignedAt: assignedAtMap }, getWorksTtlSeconds());
 
     const works = [...sessions, ...platformExtras];
+
+    // Дата выдачи для всех работ: из platform activity, иначе (для уже
+    // проверенных работ, которых больше нет в расписании) — когда мы забрали
+    // сессию. null уедет в конец при сортировке по дате.
+    for (const w of works) {
+      if (w.assigned_at == null) {
+        w.assigned_at = assignedAtMap[w.platform_material_id] ?? w.fetched_at ?? null;
+      }
+    }
 
     // Attach real platform subjects (same catalog as the Materials page filter),
     // matched by platform_material_id — replaces the internal subject_code guess.

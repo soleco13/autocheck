@@ -2,7 +2,7 @@ import { useState, useMemo, FormEvent } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
-  ArrowLeft, Play, FileText, Filter,
+  ArrowLeft, Play, FileText, Filter, ArrowUpDown,
   AlertTriangle, Clock, ExternalLink, Layers, Square, Search, X,
 } from 'lucide-react'
 import { getStudent, getStudentWorks } from '../api/client'
@@ -13,6 +13,11 @@ import { useCheckContext } from '../context/CheckContext'
 
 const PAGE_SIZE = 20
 const EDIK_BASE = 'https://editor.good-teach.itgen.io'
+
+function formatDate(ts: string | null) {
+  if (!ts) return '—'
+  try { return new Date(ts).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' }) } catch { return '—' }
+}
 
 export default function StudentCard() {
   const { id } = useParams<{ id: string }>()
@@ -26,6 +31,7 @@ export default function StudentCard() {
   const [statusFilter, setStatusFilter] = useState<string>('')
   const [subjectFilter, setSubjectFilter] = useState<string>('')
   const [searchQuery, setSearchQuery] = useState('')
+  const [sortOrder, setSortOrder] = useState<'new' | 'old'>('new')
 
   const { data: student, isLoading: loadingStudent } = useQuery({
     queryKey: ['student', id],
@@ -64,8 +70,24 @@ export default function StudentCard() {
     return list
   }, [works, statusFilter, subjectFilter, searchQuery])
 
-  const totalPages = Math.ceil(filtered.length / PAGE_SIZE)
-  const pagedWorks = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  // Сортировка по дате выдачи материала (assigned_at с платформы).
+  // Работы без даты всегда в конце, независимо от направления.
+  const sorted = useMemo(() => {
+    const ts = (w: any) => {
+      const t = w.assigned_at ? Date.parse(w.assigned_at) : NaN
+      return Number.isNaN(t) ? null : t
+    }
+    return [...filtered].sort((a, b) => {
+      const ta = ts(a), tb = ts(b)
+      if (ta === null && tb === null) return 0
+      if (ta === null) return 1
+      if (tb === null) return -1
+      return sortOrder === 'new' ? tb - ta : ta - tb
+    })
+  }, [filtered, sortOrder])
+
+  const totalPages = Math.ceil(sorted.length / PAGE_SIZE)
+  const pagedWorks = sorted.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
 
   const checkedCount = works.filter(w => !!w.check_status).length
   const uncheckedCount = works.filter(w => !w.check_status).length
@@ -235,6 +257,23 @@ export default function StudentCard() {
             </select>
           )}
 
+          {/* Sort by assignment date */}
+          {works.length > 0 && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <ArrowUpDown size={13} color="var(--c-text-3)" />
+              <select
+                value={sortOrder}
+                onChange={e => { setSortOrder(e.target.value as 'new' | 'old'); setPage(1) }}
+                className="input"
+                style={{ width: 'auto', height: 34, paddingTop: 4, paddingBottom: 4 }}
+                title="Сортировка по дате выдачи материала"
+              >
+                <option value="new">Сначала новые</option>
+                <option value="old">Сначала старые</option>
+              </select>
+            </div>
+          )}
+
           {/* Bulk buttons */}
           {uncheckedWithToken.length > 0 && !myBulkRunning && (
             <div style={{ display: 'flex', gap: 6 }}>
@@ -327,6 +366,7 @@ export default function StudentCard() {
             <thead>
               <tr>
                 <th>Материал</th>
+                <th style={{ width: 110 }}>Выдан</th>
                 <th style={{ width: 140 }}>Статус</th>
                 <th style={{ width: 120 }}>Оценка</th>
                 <th style={{ width: 190, textAlign: 'right' }}></th>
@@ -381,6 +421,11 @@ export default function StudentCard() {
                           </a>
                         )}
                       </div>
+                    </td>
+                    <td>
+                      <span style={{ fontSize: 12, color: 'var(--c-text-2)', whiteSpace: 'nowrap' }}>
+                        {formatDate(work.assigned_at)}
+                      </span>
                     </td>
                     <td>
                       {isItemChecking && itemStatus ? (
