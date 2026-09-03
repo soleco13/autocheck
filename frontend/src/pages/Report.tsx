@@ -237,7 +237,7 @@ function TaskCard({ ans, globalIdx, expanded, onToggle, flash, overrides, setSco
                   </span>
                   <div>
                     <div style={{ fontSize: 11, fontWeight: 800, color: '#ea580c', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 2 }}>Нужна ручная проверка</div>
-                    <p style={{ fontSize: 13.5, color: '#c2410c', lineHeight: 1.55, margin: 0 }}>{ans.ai_teacher_note}</p>
+                    <p style={{ fontSize: 13.5, color: '#c2410c', lineHeight: 1.55, margin: 0 }}><MathText>{ans.ai_teacher_note}</MathText></p>
                   </div>
                 </div>
               )}
@@ -396,7 +396,7 @@ function SubAnswerRow({ ans, partNum, overrides, setScore }: {
           </span>
           <div>
             <div style={{ fontSize: 10.5, fontWeight: 800, color: '#ea580c', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 2 }}>Нужна ручная проверка</div>
-            <p style={{ fontSize: 13, color: '#c2410c', lineHeight: 1.5, margin: 0 }}>{ans.ai_teacher_note}</p>
+            <p style={{ fontSize: 13, color: '#c2410c', lineHeight: 1.5, margin: 0 }}><MathText>{ans.ai_teacher_note}</MathText></p>
           </div>
         </div>
       )}

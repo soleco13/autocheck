@@ -1,6 +1,5 @@
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 import { COVERS_DIR } from '../services/cover-renderer';
 import { Router, Response } from 'express';
 import multer from 'multer';
@@ -16,9 +15,17 @@ const router = Router();
 
 // ── multer: temp storage, 50 MB limit, PDF only ──────────────────────────────
 
+// backend-api and backend-worker are separate containers; the uploaded file must
+// land on a volume both can see (the shared `covers` mount), not a container-local
+// /tmp, or the worker's later fs.readFileSync(filePath) fails with ENOENT.
+const UPLOADS_DIR = path.join(COVERS_DIR, 'tmp-uploads');
+
 const upload = multer({
   storage: multer.diskStorage({
-    destination: os.tmpdir(),
+    destination: (_req, _file, cb) => {
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+      cb(null, UPLOADS_DIR);
+    },
     filename: (_req, file, cb) => {
       const unique = `tb_${Date.now()}_${Math.random().toString(36).slice(2)}`;
       cb(null, unique + path.extname(file.originalname));
@@ -122,6 +129,10 @@ router.post(
       return;
     }
 
+    // multer/busboy decode multipart filenames as latin1 regardless of the
+    // browser's actual UTF-8 encoding — re-decode so Cyrillic names aren't mangled.
+    const originalFilename = Buffer.from(file.originalname, 'latin1').toString('utf8');
+
     try {
       // Create document record
       const insertResult = await db.query(
@@ -131,7 +142,7 @@ router.post(
          RETURNING id`,
         [
           req.teacherId,
-          file.originalname,
+          originalFilename,
           title.trim(),
           author?.trim() || null,
           subjectCode || null,

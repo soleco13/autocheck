@@ -54,6 +54,9 @@ import platformRouter from './api/platform';
 import { requireAuth } from './middleware/auth-middleware';
 
 const app = express();
+// Behind the nginx reverse proxy in production — required so req.ip / express-rate-limit
+// read the real client IP from X-Forwarded-For instead of nginx's internal address.
+app.set('trust proxy', 1);
 const PORT = parseInt(process.env.PORT || '3001', 10);
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 const IS_PROD = process.env.NODE_ENV === 'production';

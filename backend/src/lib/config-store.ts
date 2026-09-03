@@ -145,7 +145,7 @@ export const PARAM_META: Record<string, ParamMeta> = {
   works_cache_ttl_min: {
     label: 'Кеш работ ученика', unit: 'мин',
     description: 'Как долго хранится кеш работ ученика с платформы до повторного запроса.',
-    category: 'cache', type: 'int', default: 5, min: 1, max: 60, live: true,
+    category: 'cache', type: 'int', default: 2, min: 1, max: 60, live: true,
   },
 };
 

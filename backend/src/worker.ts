@@ -115,10 +115,12 @@ if (require.main === module) {
     await configStore.load();
     initDDPConnections().catch(() => { /* connects lazily on demand too */ });
     startCheckWorker();
+    const textbookWorker = startTextbookWorker();
 
     const shutdown = async () => {
       console.log('[worker] shutting down…');
       if (worker) await worker.close();
+      await textbookWorker.close();
       process.exit(0);
     };
     process.on('SIGTERM', shutdown);

@@ -14,6 +14,9 @@ async function callReportAI(userPrompt: string, maxTokens = 1200): Promise<strin
         max_tokens: maxTokens,
         messages: [{ role: 'user', content: userPrompt }],
       });
+      if (response.choices[0]?.finish_reason === 'length') {
+        console.warn(`[report-generator] ${MODEL} response hit the ${maxTokens}-token cap — summary may be cut off`);
+      }
       return response.choices[0]?.message?.content ?? '';
     } catch (err: any) {
       const status: number = err?.status ?? 0;
@@ -156,9 +159,12 @@ export async function generateReport(sessionId: string): Promise<string> {
       // Throttle both calls (2 slots) before firing — prevents 429 cascade under bulk load.
       await aiThrottle.acquire();
       await aiThrottle.acquire();
+      // Cyrillic tokenises at roughly 2 chars/token, so the prompt's "4–6
+      // предложений" / "3–5 предложений" paragraphs plus any run-over need real
+      // headroom — 700/550 was cutting summaries off mid-sentence.
       const [studentText, teacherText] = await Promise.all([
-        callReportAI(summaryPrompt, 700),
-        callReportAI(teacherSummaryPrompt, 550),
+        callReportAI(summaryPrompt, 1500),
+        callReportAI(teacherSummaryPrompt, 1500),
       ]);
       aiSummaryForStudent = studentText;
       aiSummaryForTeacher = teacherText;
