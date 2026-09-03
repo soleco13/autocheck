@@ -1,26 +1,24 @@
 #!/usr/bin/env bash
-# AutoCheck PostgreSQL backup script
-# Add to crontab: 0 2 * * * /path/to/autocheck/scripts/backup.sh >> /var/log/autocheck-backup.log 2>&1
-
+# AutoCheck PostgreSQL backup — runs pg_dump inside the postgres container.
+# Cron: 0 2 * * * /opt/autocheck/scripts/backup.sh >> /var/log/autocheck-backup.log 2>&1
 set -euo pipefail
+trap 'rc=$?; [ $rc -ne 0 ] && /opt/autocheck/scripts/notify.sh "🔴 backup.sh упал (код $rc, строка $LINENO) — бэкап БД не создан" 2>/dev/null || true' EXIT
 
-BACKUP_DIR="${BACKUP_DIR:-/backup/autocheck}"
+COMPOSE_DIR="/opt/autocheck"
+BACKUP_DIR="${BACKUP_DIR:-/opt/autocheck/backups}"
 DB_NAME="${DB_NAME:-autocheck}"
-DB_USER="${DB_USER:-postgres}"
+DB_USER="${DB_USER:-autocheck}"
 KEEP_DAYS="${KEEP_DAYS:-30}"
 
 mkdir -p "$BACKUP_DIR"
+cd "$COMPOSE_DIR"
 
 STAMP=$(date +%Y%m%d_%H%M%S)
 FILE="$BACKUP_DIR/autocheck_${STAMP}.sql.gz"
 
-echo "[$(date -Iseconds)] Starting backup → $FILE"
-pg_dump -U "$DB_USER" -d "$DB_NAME" | gzip > "$FILE"
+echo "[$(date -Iseconds)] Starting backup -> $FILE"
+docker compose exec -T postgres pg_dump -U "$DB_USER" -d "$DB_NAME" | gzip > "$FILE"
 echo "[$(date -Iseconds)] Backup complete: $(du -sh "$FILE" | cut -f1)"
 
-# Remove backups older than KEEP_DAYS
 find "$BACKUP_DIR" -name "autocheck_*.sql.gz" -mtime "+${KEEP_DAYS}" -delete
 echo "[$(date -Iseconds)] Cleanup done. Backups kept: $(ls "$BACKUP_DIR" | wc -l)"
-
-# Optional: copy to S3 (uncomment and configure)
-# aws s3 cp "$FILE" "s3://your-bucket/autocheck-backups/$(basename $FILE)"

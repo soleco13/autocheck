@@ -3,6 +3,7 @@
 # certbot-etc) are never touched by these commands — only dangling/unused
 # images, stopped containers and build cache.
 set -euo pipefail
+trap 'rc=$?; [ $rc -ne 0 ] && /opt/autocheck/scripts/notify.sh "🔴 prune.sh упал (код $rc, строка $LINENO)" 2>/dev/null || true' EXIT
 echo "[$(date -Iseconds)] docker system prune"
 docker container prune -f
 docker image prune -af --filter "until=168h"
