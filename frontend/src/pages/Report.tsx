@@ -6,7 +6,7 @@ import {
   Clock, Pencil, BookOpen, MessageSquare, ChevronDown, ChevronRight,
   Award, TrendingUp, Eye, Sparkles, Filter, FileDown,
 } from 'lucide-react'
-import { getCheckReport, overrideAnswerScore, downloadKp } from '../api/client'
+import { getCheckReport, overrideAnswerScore, downloadKp, downloadReportDoc } from '../api/client'
 import { toast } from '../components/Toast'
 import { MathText } from '../components/MathText'
 import { Donut } from '../components/Charts'
@@ -514,6 +514,7 @@ export default function Report() {
   const [flashId, setFlashId] = useState<string | null>(null)
   const [openSummary, setOpenSummary] = useState<{ student: boolean; teacher: boolean }>({ student: false, teacher: false })
   const [kpLoading, setKpLoading] = useState(false)
+  const [docLoading, setDocLoading] = useState(false)
   const refs = useRef<Record<string, HTMLElement | null>>({})
 
   const [pollExpired, setPollExpired] = useState(false)
@@ -592,6 +593,19 @@ export default function Report() {
       toast.error(err?.message || 'Не удалось сформировать КП')
     } finally {
       setKpLoading(false)
+    }
+  }
+
+  const handleDownloadDoc = async () => {
+    if (!sessionId) return
+    setDocLoading(true)
+    try {
+      await downloadReportDoc(sessionId)
+      toast.success('Отчёт сформирован')
+    } catch (err: any) {
+      toast.error(err?.message || 'Не удалось сформировать отчёт')
+    } finally {
+      setDocLoading(false)
     }
   }
 
@@ -720,8 +734,18 @@ export default function Report() {
                 {report.topic && <span style={{ fontSize: 13, color: 'var(--c-text-3)' }}>{report.topic}</span>}
               </div>
 
-              {isTestMaterial(report.title) && (
-                <div style={{ marginTop: 16 }}>
+              <div style={{ marginTop: 16, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  className="btn btn-sm"
+                  onClick={handleDownloadDoc}
+                  disabled={docLoading}
+                  style={{ background: '#fff', border: '1px solid var(--c-border-solid)', color: 'var(--c-text)', fontWeight: 650, display: 'inline-flex', alignItems: 'center', gap: 7 }}
+                >
+                  {docLoading
+                    ? <><span className="spinner spinner-dark" style={{ width: 14, height: 14, borderWidth: 2 }} /> Формирую…</>
+                    : <><FileDown size={15} /> Скачать отчёт (.docx)</>}
+                </button>
+                {isTestMaterial(report.title) && (
                   <button
                     className="btn btn-sm"
                     onClick={handleDownloadKp}
@@ -732,9 +756,11 @@ export default function Report() {
                       ? <><span className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} /> Формирую…</>
                       : <><FileDown size={15} /> Скачать КП (.docx)</>}
                   </button>
-                  <div style={{ fontSize: 12, color: 'var(--c-text-3)', marginTop: 6 }}>
-                    Коррекционная программа по темам заданий с ошибками
-                  </div>
+                )}
+              </div>
+              {isTestMaterial(report.title) && (
+                <div style={{ fontSize: 12, color: 'var(--c-text-3)', marginTop: 6 }}>
+                  КП — коррекционная программа по темам заданий с ошибками
                 </div>
               )}
             </div>

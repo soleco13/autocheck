@@ -189,14 +189,14 @@ export async function waitForJobs(
 export const getCheckReport = (sessionId: string) =>
   api.get(`/checks/${sessionId}/report`).then(r => r.data)
 
-// Коррекционная программа (.docx) — генерируется и скачивается по клику.
-// Доступна только для материалов-тестирований.
-export const downloadKp = async (sessionId: string) => {
+// Скачивание файла, который бэкенд отдаёт как attachment.
+// Ошибочный ответ приходит как Blob с JSON внутри — вытаскиваем сообщение.
+const downloadFile = async (path: string, fallbackName: string) => {
   try {
-    const r = await api.get(`/checks/${sessionId}/kp`, { responseType: 'blob' })
+    const r = await api.get(path, { responseType: 'blob' })
     const cd: string = r.headers['content-disposition'] || ''
     const m = /filename\*=UTF-8''([^;]+)/.exec(cd)
-    const name = m ? decodeURIComponent(m[1]) : 'КП.docx'
+    const name = m ? decodeURIComponent(m[1]) : fallbackName
     const url = URL.createObjectURL(r.data)
     const a = document.createElement('a')
     a.href = url
@@ -206,7 +206,6 @@ export const downloadKp = async (sessionId: string) => {
     a.remove()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   } catch (err: any) {
-    // Ошибочный ответ приходит как Blob — вытаскиваем текст сообщения
     const blob = err?.response?.data
     if (blob instanceof Blob) {
       try {
@@ -219,6 +218,14 @@ export const downloadKp = async (sessionId: string) => {
     throw err
   }
 }
+
+// Коррекционная программа (.docx) — только для материалов-тестирований.
+export const downloadKp = (sessionId: string) =>
+  downloadFile(`/checks/${sessionId}/kp`, 'КП.docx')
+
+// Страница отчёта о проверке в .docx — для любого проверенного материала.
+export const downloadReportDoc = (sessionId: string) =>
+  downloadFile(`/checks/${sessionId}/report-doc`, 'Отчёт.docx')
 
 // Reports
 export const getReport = (id: string) =>

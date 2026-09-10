@@ -34,7 +34,7 @@ export function isTestMaterial(title: string | null | undefined): boolean {
 }
 
 // ── Предмет и «класс проверочной работы» из названия материала ───────────────
-const SUBJECT_BY_CODE: Record<string, string> = {
+export const SUBJECT_BY_CODE: Record<string, string> = {
   РЯ: 'Русский язык', Р: 'Русский язык',
   МА: 'Математика', М: 'Математика',
   А: 'Алгебра', Г: 'Геометрия',

@@ -5,6 +5,7 @@ import { enqueueCheckJob, enqueueCheckBatch, EnqueueParams } from '../services/c
 import { safeError } from '../lib/safe-error';
 import { logger } from '../lib/logger';
 import { generateKpDocx, KpError } from '../services/kp-generator';
+import { generateReportDocx, ReportDocError } from '../services/report-doc-generator';
 import rateLimit from 'express-rate-limit';
 import { configStore } from '../lib/config-store';
 
@@ -283,6 +284,31 @@ router.get('/:sessionId/kp', requireAuth, async (req: AuthRequest, res: Response
       return;
     }
     logger.error({ err }, 'KP generation error');
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// GET /api/checks/:sessionId/report-doc — страница отчёта о проверке в .docx.
+// Доступно для любого проверенного материала.
+router.get('/:sessionId/report-doc', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { filename, buffer } = await generateReportDocx(req.params.sessionId, req.teacherId!);
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="report.docx"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    );
+    res.setHeader('Content-Length', String(buffer.length));
+    res.end(buffer);
+  } catch (err: any) {
+    if (err instanceof ReportDocError) {
+      res.status(err.code === 'NOT_FOUND' ? 404 : 400).json({ error: err.message });
+      return;
+    }
+    logger.error({ err }, 'Report doc generation error');
     res.status(500).json({ error: safeError(err) });
   }
 });
