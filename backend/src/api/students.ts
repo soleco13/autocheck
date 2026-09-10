@@ -48,7 +48,7 @@ router.get('/', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const search  = (req.query.search  as string || '').trim();
     const page     = Math.max(1, parseInt(req.query.page     as string || '1',  10));
-    const pageSize = Math.min(200, Math.max(1, parseInt(req.query.pageSize as string || '200', 10)));
+    const pageSize = Math.min(2000, Math.max(1, parseInt(req.query.pageSize as string || '2000', 10)));
     const offset   = (page - 1) * pageSize;
 
     const conditions: string[] = ['ts.teacher_id = $1'];
