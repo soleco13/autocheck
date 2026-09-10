@@ -4,6 +4,7 @@ import { db } from '../db';
 import { enqueueCheckJob, enqueueCheckBatch, EnqueueParams } from '../services/check-runner';
 import { safeError } from '../lib/safe-error';
 import { logger } from '../lib/logger';
+import { generateKpDocx, KpError } from '../services/kp-generator';
 import rateLimit from 'express-rate-limit';
 import { configStore } from '../lib/config-store';
 
@@ -256,6 +257,32 @@ router.get('/:sessionId/report', requireAuth, async (req: AuthRequest, res: Resp
     res.json({ ...report, answers: answersResult.rows });
   } catch (err: any) {
     logger.error({ err }, 'Get check report error');
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// GET /api/checks/:sessionId/kp — коррекционная программа (.docx) по итогам
+// проверочного тестирования. Доступно только для материалов-тестирований.
+router.get('/:sessionId/kp', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { filename, buffer } = await generateKpDocx(req.params.sessionId, req.teacherId!);
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="kp.docx"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    );
+    res.setHeader('Content-Length', String(buffer.length));
+    res.end(buffer);
+  } catch (err: any) {
+    if (err instanceof KpError) {
+      const httpStatus = err.code === 'NOT_FOUND' ? 404 : err.code === 'NO_FAILED_TASKS' ? 409 : 400;
+      res.status(httpStatus).json({ error: err.message });
+      return;
+    }
+    logger.error({ err }, 'KP generation error');
     res.status(500).json({ error: safeError(err) });
   }
 });

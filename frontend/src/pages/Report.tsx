@@ -4,9 +4,9 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft, CheckCircle, XCircle, AlertCircle, AlertTriangle,
   Clock, Pencil, BookOpen, MessageSquare, ChevronDown, ChevronRight,
-  Award, TrendingUp, Eye, Sparkles, Filter,
+  Award, TrendingUp, Eye, Sparkles, Filter, FileDown,
 } from 'lucide-react'
-import { getCheckReport, overrideAnswerScore } from '../api/client'
+import { getCheckReport, overrideAnswerScore, downloadKp } from '../api/client'
 import { toast } from '../components/Toast'
 import { MathText } from '../components/MathText'
 import { Donut } from '../components/Charts'
@@ -17,6 +17,9 @@ const TYPE_LABEL: Record<string, string> = {
 }
 
 const ATTENTION = ['incorrect', 'partial', 'manual_required']
+
+// Материал-тестирование — по нему можно скачать коррекционную программу (КП)
+const isTestMaterial = (title?: string | null) => /тестировани/i.test(title || '')
 
 const R_META: Record<string, { label: string; color: string; accent: string; bg: string; icon: React.ReactNode; cell: string; cellText: string; hollow: boolean }> = {
   correct:         { label: 'Верно',             color: '#15803d', accent: '#22c55e', bg: '#f0fdf4', icon: <CheckCircle size={16} />, cell: '#16a34a', cellText: '#fff', hollow: false },
@@ -510,6 +513,7 @@ export default function Report() {
   const [filter, setFilter] = useState<'all' | 'attention' | 'correct'>('all')
   const [flashId, setFlashId] = useState<string | null>(null)
   const [openSummary, setOpenSummary] = useState<{ student: boolean; teacher: boolean }>({ student: false, teacher: false })
+  const [kpLoading, setKpLoading] = useState(false)
   const refs = useRef<Record<string, HTMLElement | null>>({})
 
   const [pollExpired, setPollExpired] = useState(false)
@@ -575,6 +579,19 @@ export default function Report() {
       toast.success('Балл обновлён')
     } catch {
       toast.error('Не удалось обновить балл')
+    }
+  }
+
+  const handleDownloadKp = async () => {
+    if (!sessionId) return
+    setKpLoading(true)
+    try {
+      await downloadKp(sessionId)
+      toast.success('Коррекционная программа сформирована')
+    } catch (err: any) {
+      toast.error(err?.message || 'Не удалось сформировать КП')
+    } finally {
+      setKpLoading(false)
     }
   }
 
@@ -702,6 +719,24 @@ export default function Report() {
                 )}
                 {report.topic && <span style={{ fontSize: 13, color: 'var(--c-text-3)' }}>{report.topic}</span>}
               </div>
+
+              {isTestMaterial(report.title) && (
+                <div style={{ marginTop: 16 }}>
+                  <button
+                    className="btn btn-sm"
+                    onClick={handleDownloadKp}
+                    disabled={kpLoading}
+                    style={{ background: 'var(--c-primary)', color: '#fff', fontWeight: 650, display: 'inline-flex', alignItems: 'center', gap: 7 }}
+                  >
+                    {kpLoading
+                      ? <><span className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} /> Формирую…</>
+                      : <><FileDown size={15} /> Скачать КП (.docx)</>}
+                  </button>
+                  <div style={{ fontSize: 12, color: 'var(--c-text-3)', marginTop: 6 }}>
+                    Коррекционная программа по темам заданий с ошибками
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Verdict + grade */}

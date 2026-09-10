@@ -189,6 +189,37 @@ export async function waitForJobs(
 export const getCheckReport = (sessionId: string) =>
   api.get(`/checks/${sessionId}/report`).then(r => r.data)
 
+// Коррекционная программа (.docx) — генерируется и скачивается по клику.
+// Доступна только для материалов-тестирований.
+export const downloadKp = async (sessionId: string) => {
+  try {
+    const r = await api.get(`/checks/${sessionId}/kp`, { responseType: 'blob' })
+    const cd: string = r.headers['content-disposition'] || ''
+    const m = /filename\*=UTF-8''([^;]+)/.exec(cd)
+    const name = m ? decodeURIComponent(m[1]) : 'КП.docx'
+    const url = URL.createObjectURL(r.data)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  } catch (err: any) {
+    // Ошибочный ответ приходит как Blob — вытаскиваем текст сообщения
+    const blob = err?.response?.data
+    if (blob instanceof Blob) {
+      try {
+        const msg = JSON.parse(await blob.text())?.error
+        if (msg) throw new Error(msg)
+      } catch (e: any) {
+        if (e?.message) throw e
+      }
+    }
+    throw err
+  }
+}
+
 // Reports
 export const getReport = (id: string) =>
   api.get(`/reports/${id}`).then(r => r.data)
