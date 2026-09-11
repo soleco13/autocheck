@@ -22,6 +22,7 @@ COPY --from=prod-deps /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY package.json ./
 COPY migrations ./migrations
+COPY templates ./templates
 RUN mkdir -p /app/covers && chown -R node:node /app
 USER node
 EXPOSE 3001
