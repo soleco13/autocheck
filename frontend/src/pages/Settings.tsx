@@ -32,6 +32,11 @@ const PROMPT_META: Record<string, { label: string; desc: string; model: string }
     desc: 'Профессиональная сводка и рекомендации для преподавателя в итоговом отчёте.',
     model: 'anthropic/claude-sonnet-5',
   },
+  kp_topics: {
+    label: 'Промпт коррекционной программы (КП)',
+    desc: 'Как ИИ подбирает учебные темы для повторения и число занятий по заданиям с ошибками при генерации КП. Персональные данные ученика в модель не передаются.',
+    model: 'anthropic/claude-sonnet-5',
+  },
 }
 
 function formatNum(n: number): string {
