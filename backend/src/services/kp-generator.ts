@@ -243,13 +243,26 @@ function removeNarrativeParagraph(xml: string): string {
   return xml.slice(0, start) + xml.slice(end + '</w:p>'.length);
 }
 
-function fillTable(xml: string, rowsXml: string): string {
+function fillTable(xml: string, rowsXml: string, afterTableXml = ''): string {
   const gi = xml.indexOf('<w:gridCol w:w="1225"/>');
   if (gi === -1) throw new Error('template: таблица тем не найдена');
   const hdrClose = xml.indexOf('</w:tr>', gi) + '</w:tr>'.length;
   const tblClose = xml.indexOf('</w:tbl>', hdrClose);
   if (tblClose === -1) throw new Error('template: конец таблицы не найден');
-  return xml.slice(0, hdrClose) + rowsXml + xml.slice(tblClose);
+  const tblCloseEnd = tblClose + '</w:tbl>'.length;
+  return xml.slice(0, hdrClose) + rowsXml + xml.slice(tblClose, tblCloseEnd) + afterTableXml + xml.slice(tblCloseEnd);
+}
+
+/** Текстовая строка с итогом теста, вставляется сразу после таблицы тем. */
+function resultParagraph(pct: number, errors: number, total: number): string {
+  const rPr =
+    `<w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:eastAsia="Times New Roman" w:cs="Times New Roman" />` +
+    `<w:b/><w:sz w:val="24" /><w:szCs w:val="24" /></w:rPr>`;
+  const text = `Результат тестирования: ${pct}% — ошибок: ${errors} из ${total} заданий`;
+  return (
+    `<w:p><w:pPr><w:spacing w:before="240" w:after="240"/>${rPr}</w:pPr>` +
+    `<w:r>${rPr}<w:t xml:space="preserve">${xmlEsc(text)}</w:t></w:r></w:p>`
+  );
 }
 
 // ── Основная функция ───────────────────────────────────────────────────────
@@ -266,7 +279,8 @@ export async function generateKpDocx(sessionOrReportId: string, teacherId: strin
   const sessRes = await db.query(
     `SELECT ss.id, ss.teacher_id, cs.title, cs.grade, cs.subject_code,
             s.full_name AS student_name,
-            tch.full_name AS teacher_name
+            tch.full_name AS teacher_name,
+            r.percentage
      FROM student_sessions ss
      JOIN control_sheets cs ON cs.id = ss.control_sheet_id
      JOIN students s ON s.id = ss.student_id
@@ -301,6 +315,12 @@ export async function generateKpDocx(sessionOrReportId: string, teacherId: strin
   if (failed.length === 0) {
     throw new KpError('В работе нет заданий с ошибками — коррекционная программа не требуется', 'NO_FAILED_TASKS');
   }
+
+  const totalTasks = ansRes.rows.length;
+  const errorsCount = failed.length;
+  const resultPct = sess.percentage != null
+    ? Math.round(Number(sess.percentage))
+    : (totalTasks ? Math.round(((totalTasks - errorsCount) / totalTasks) * 100) : 0);
 
   const { subjectName: parsedSubject, testedGrade } = parseTestTitle(sess.title);
   const subjectName = parsedSubject || SUBJECT_BY_CODE[sess.subject_code] || sess.subject_code || '';
@@ -377,7 +397,7 @@ export async function generateKpDocx(sessionOrReportId: string, teacherId: strin
     `$1${totalLessons}$2`,
   );
 
-  xml = fillTable(xml, rowsXml);
+  xml = fillTable(xml, rowsXml, resultParagraph(resultPct, errorsCount, totalTasks));
 
   zip.file('word/document.xml', xml);
   const buffer: Buffer = zip.generate({ type: 'nodebuffer', compression: 'DEFLATE' });
