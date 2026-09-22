@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Users, RefreshCw, AlertTriangle, Search, Grid2x2, List, ChevronRight, X } from 'lucide-react'
@@ -53,15 +53,32 @@ function StudentGridCard({ student, onClick }: { student: any; onClick: () => vo
   )
 }
 
+const FILTERS_KEY = 'autocheck:students-filters'
+
+function loadFilters(): { search: string; classroomFilter: string; gradeFilter: string; view: 'grid' | 'list' } {
+  try {
+    const raw = localStorage.getItem(FILTERS_KEY)
+    if (raw) return { search: '', classroomFilter: '', gradeFilter: '', view: 'grid', ...JSON.parse(raw) }
+  } catch { /* ignore corrupt/blocked storage */ }
+  return { search: '', classroomFilter: '', gradeFilter: '', view: 'grid' }
+}
+
 export default function Dashboard() {
   const navigate = useNavigate()
   const qc = useQueryClient()
   const [syncing, setSyncing] = useState(false)
   const [syncingClassrooms, setSyncingClassrooms] = useState(false)
-  const [search, setSearch] = useState('')
-  const [classroomFilter, setClassroomFilter] = useState('')
-  const [gradeFilter, setGradeFilter] = useState('')
-  const [view, setView] = useState<'grid' | 'list'>('grid')
+  const initialFilters = useMemo(loadFilters, [])
+  const [search, setSearch] = useState(initialFilters.search)
+  const [classroomFilter, setClassroomFilter] = useState(initialFilters.classroomFilter)
+  const [gradeFilter, setGradeFilter] = useState(initialFilters.gradeFilter)
+  const [view, setView] = useState<'grid' | 'list'>(initialFilters.view)
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(FILTERS_KEY, JSON.stringify({ search, classroomFilter, gradeFilter, view }))
+    } catch { /* ignore full/blocked storage */ }
+  }, [search, classroomFilter, gradeFilter, view])
 
   const { data: students = [], isLoading } = useQuery({
     queryKey: ['students'],
