@@ -624,22 +624,38 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
         const textTasks = slideTasks.filter(t => t.taskType !== 'photo_answer');
         const consumedPhotoIds = new Set<string>();
 
+        // Match on the slide's shared problem text (`_slideProblem`), not the full
+        // `questionText` — questionText also mixes in a per-component hint gathered by
+        // walking up from that specific object, which can differ trivially between the
+        // text field and the photo loader (e.g. one picks up a stray emoji-only sibling
+        // the other doesn't), breaking an exact-string match even though both
+        // components belong to the same exercise. `_slideProblem` comes from the same
+        // whole-slide extraction call for every component on the slide, so it's
+        // byte-identical whenever they're really the same exercise.
+        const slideProblemOf = (t: ParsedTask) => (t.studentAnswerStructured?._slideProblem || '').trim();
+
         for (const task of textTasks) {
-          if (!task.questionText) continue;
-          const match = photoTasks.find(p =>
-            !consumedPhotoIds.has(p.componentId) && p.questionText === task.questionText);
-          if (!match) continue;
-          consumedPhotoIds.add(match.componentId);
-          const photos = match.studentAnswerStructured?.photos ?? [];
+          const key = slideProblemOf(task);
+          if (!key) continue;
+          // Only merge when this text task is the SOLE one sharing that slide problem —
+          // a multi-part slide (several sub-answers under one shared problem statement)
+          // would make an automatic photo→task pairing a guess, so leave those alone.
+          const rivalTexts = textTasks.filter(t => slideProblemOf(t) === key);
+          if (rivalTexts.length !== 1) continue;
+          const matches = photoTasks.filter(p => slideProblemOf(p) === key);
+          if (matches.length === 0) continue;
+
+          const allPhotos = matches.flatMap(m => m.studentAnswerStructured?.photos ?? []);
+          matches.forEach(m => consumedPhotoIds.add(m.componentId));
           task.studentAnswerStructured = {
             ...task.studentAnswerStructured,
-            photos,
-            _photoComponentId: match.componentId,
+            photos: allPhotos,
+            _photoComponentId: matches.map(m => m.componentId).join(','),
           };
-          if (photos.length > 0) {
+          if (allPhotos.length > 0) {
             task.studentAnswer = task.studentAnswer
-              ? `${task.studentAnswer}\n[приложено фото: ${photos.length}]`
-              : `[приложено фото: ${photos.length}]`;
+              ? `${task.studentAnswer}\n[приложено фото: ${allPhotos.length}]`
+              : `[приложено фото: ${allPhotos.length}]`;
           }
         }
 
