@@ -1,4 +1,4 @@
-import { useState, useMemo, FormEvent } from 'react'
+import { useState, useMemo, useEffect, FormEvent } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -19,6 +19,16 @@ function formatDate(ts: string | null) {
   try { return new Date(ts).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' }) } catch { return '—' }
 }
 
+const WORK_FILTERS_KEY = 'autocheck:student-work-filters'
+
+function loadWorkFilters(): { statusFilter: string; subjectFilter: string; searchQuery: string; sortOrder: 'new' | 'old' } {
+  try {
+    const raw = localStorage.getItem(WORK_FILTERS_KEY)
+    if (raw) return { statusFilter: '', subjectFilter: '', searchQuery: '', sortOrder: 'new', ...JSON.parse(raw) }
+  } catch { /* ignore corrupt/blocked storage */ }
+  return { statusFilter: '', subjectFilter: '', searchQuery: '', sortOrder: 'new' }
+}
+
 export default function StudentCard() {
   const { id } = useParams<{ id: string }>()
   const { checking, checkStatuses, bulkChecks, runCheck, startBulkCheck, stopBulkCheck } = useCheckContext()
@@ -28,10 +38,20 @@ export default function StudentCard() {
   const [showNewCheck, setShowNewCheck] = useState(false)
   const [newEditorUrl, setNewEditorUrl] = useState('')
   const [page, setPage] = useState(1)
-  const [statusFilter, setStatusFilter] = useState<string>('')
-  const [subjectFilter, setSubjectFilter] = useState<string>('')
-  const [searchQuery, setSearchQuery] = useState('')
-  const [sortOrder, setSortOrder] = useState<'new' | 'old'>('new')
+  const initialWorkFilters = useMemo(loadWorkFilters, [])
+  const [statusFilter, setStatusFilter] = useState<string>(initialWorkFilters.statusFilter)
+  const [subjectFilter, setSubjectFilter] = useState<string>(initialWorkFilters.subjectFilter)
+  const [searchQuery, setSearchQuery] = useState(initialWorkFilters.searchQuery)
+  const [sortOrder, setSortOrder] = useState<'new' | 'old'>(initialWorkFilters.sortOrder)
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(WORK_FILTERS_KEY, JSON.stringify({ statusFilter, subjectFilter, searchQuery, sortOrder }))
+    } catch { /* ignore full/blocked storage */ }
+  }, [statusFilter, subjectFilter, searchQuery, sortOrder])
+
+  // Reset to page 1 whenever the viewed student changes (filters stay cached).
+  useEffect(() => { setPage(1) }, [id])
 
   const { data: student, isLoading: loadingStudent } = useQuery({
     queryKey: ['student', id],
