@@ -133,7 +133,7 @@ export async function generateReportDocx(
   const r = await db.query(
     `SELECT rep.id AS report_id, rep.total_score, rep.max_score, rep.percentage,
             rep.status, rep.generated_at,
-            rep.ai_summary_for_student,
+            rep.ai_summary_for_student, rep.ai_topics_covered,
             ss.id AS session_id, ss.fetched_at,
             s.full_name AS student_name,
             cs.title, cs.topic, cs.grade, cs.subject_code,
@@ -305,6 +305,18 @@ export async function generateReportDocx(
       `<w:insideH w:val="single" w:sz="4" w:color="AAAAAA"/><w:insideV w:val="single" w:sz="4" w:color="AAAAAA"/>` +
       `</w:tblBorders></w:tblPr>${mapHeader}${mapRows}</w:tbl>`,
   );
+
+  // ── список пройденных тем ──
+  const topicLines = String(rep.ai_topics_covered || '')
+    .split('\n')
+    .map(t => mathToText(t).replace(/^[-•*\d.)\s]+/, '').trim())
+    .filter(Boolean);
+  if (topicLines.length) {
+    body.push(H2('Темы, пройденные в материале'));
+    for (const topic of topicLines) {
+      body.push(para(run('• ' + topic), { ind: 200, spaceAfter: 40 }));
+    }
+  }
 
   // ── ИИ-сводка для ученика ──
   if ((rep.ai_summary_for_student || '').trim()) {

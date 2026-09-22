@@ -98,6 +98,7 @@ export async function generateReport(sessionId: string): Promise<string> {
   // Generate AI summary
   let aiSummaryForStudent = '';
   let aiSummaryForTeacher = '';
+  let aiTopicsCovered = '';
 
   // teacherId for prompt lookup — fetched once per report generation
   const teacherRow = await db.query('SELECT teacher_id FROM student_sessions WHERE id = $1', [sessionId]);
@@ -106,9 +107,10 @@ export async function generateReport(sessionId: string): Promise<string> {
   if (process.env.OPENROUTER_API_KEY && process.env.OPENROUTER_API_KEY !== 'your_openrouter_api_key_here') {
     try {
       // Load teacher-customisable prompts from DB (cached 5 min), fall back to defaults
-      const [studentPromptBase, teacherPromptBase] = await Promise.all([
+      const [studentPromptBase, teacherPromptBase, topicsPromptBase] = await Promise.all([
         getTeacherPrompt(teacherId, 'report_student'),
         getTeacherPrompt(teacherId, 'report_teacher'),
+        getTeacherPrompt(teacherId, 'report_topics'),
       ]);
 
       const correctCount = answers.filter((a: any) => a.status === 'correct').length;
@@ -156,18 +158,25 @@ export async function generateReport(sessionId: string): Promise<string> {
         `${teacherPromptBase}\n\n${teacherContext}\n\n` +
         `РАЗБОР ПО ЗАДАНИЯМ:\n\n${taskBreakdown}`;
 
-      // Throttle both calls (2 slots) before firing — prevents 429 cascade under bulk load.
+      const topicsPrompt =
+        `${topicsPromptBase}\n\n${studentContext}\n\n` +
+        `РАЗБОР ПО ЗАДАНИЯМ:\n\n${taskBreakdown}`;
+
+      // Throttle all three calls (3 slots) before firing — prevents 429 cascade under bulk load.
+      await aiThrottle.acquire();
       await aiThrottle.acquire();
       await aiThrottle.acquire();
       // Cyrillic tokenises at roughly 2 chars/token, so the prompt's "4–6
       // предложений" / "3–5 предложений" paragraphs plus any run-over need real
       // headroom — 700/550 was cutting summaries off mid-sentence.
-      const [studentText, teacherText] = await Promise.all([
+      const [studentText, teacherText, topicsText] = await Promise.all([
         callReportAI(summaryPrompt, 1500),
         callReportAI(teacherSummaryPrompt, 1500),
+        callReportAI(topicsPrompt, 500),
       ]);
       aiSummaryForStudent = studentText;
       aiSummaryForTeacher = teacherText;
+      aiTopicsCovered = topicsText;
     } catch (err) {
       console.error('Failed to generate AI summary:', err);
     }
@@ -184,18 +193,19 @@ export async function generateReport(sessionId: string): Promise<string> {
         total_score = $1, max_score = $2, percentage = $3, grade = $4,
         ai_summary_for_student = CASE WHEN $5 != '' THEN $5::text ELSE ai_summary_for_student END,
         ai_summary_for_teacher = CASE WHEN $6 != '' THEN $6::text ELSE ai_summary_for_teacher END,
-        status = $7, generated_at = NOW()
-      WHERE session_id = $8
+        ai_topics_covered = CASE WHEN $7 != '' THEN $7::text ELSE ai_topics_covered END,
+        status = $8, generated_at = NOW()
+      WHERE session_id = $9
       RETURNING id
-    `, [totalScore, maxScore, percentage, grade, aiSummaryForStudent, aiSummaryForTeacher, status, sessionId]);
+    `, [totalScore, maxScore, percentage, grade, aiSummaryForStudent, aiSummaryForTeacher, aiTopicsCovered, status, sessionId]);
     return existing.rows[0].id;
   } else {
     const result = await db.query(`
       INSERT INTO reports (session_id, total_score, max_score, percentage, grade,
-        ai_summary_for_student, ai_summary_for_teacher, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ai_summary_for_student, ai_summary_for_teacher, ai_topics_covered, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING id
-    `, [sessionId, totalScore, maxScore, percentage, grade, aiSummaryForStudent, aiSummaryForTeacher, status]);
+    `, [sessionId, totalScore, maxScore, percentage, grade, aiSummaryForStudent, aiSummaryForTeacher, aiTopicsCovered, status]);
     return result.rows[0].id;
   }
 }
