@@ -356,6 +356,14 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
         correctAnswer: string | null;
       }> = [];
 
+      // Collect this slide's input/photo tasks here instead of pushing straight to
+      // `tasks` — a slide can pair a text-answer field with a separate photo-upload
+      // field for the SAME exercise (type the answer + attach a photo of your work).
+      // Pushed separately they'd become two independently-scored tasks sharing one
+      // question, so a missing photo alone scores 0 on a "second copy" of an
+      // otherwise-correct exercise — see merge pass below.
+      const slideTasks: ParsedTask[] = [];
+
       for (const rootObj of slide.objects) {
         const allObjs: any[] = [rootObj, ...rootObj.getDeepChildren()];
 
@@ -375,7 +383,7 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
               if (hint && hint !== ctx.problem && !ctx.problem.includes(hint)) {
                 questionText = ctx.problem ? `${ctx.problem}\n${hint}` : hint;
               }
-              tasks.push({
+              slideTasks.push({
                 componentId: flId,
                 taskType: 'photo_answer',
                 questionText,
@@ -429,7 +437,7 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
               if (!questionText && hasImage) questionText = '[задание с изображением]';
               else if (hasImage) questionText = `${questionText} [есть изображение]`;
 
-              tasks.push({
+              slideTasks.push({
                 componentId: inputId,
                 taskType: hasCorrectAnswer ? 'check_value' : 'open_answer',
                 questionText,
@@ -598,6 +606,46 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
               }
             }
           }
+        }
+      }
+
+      // Merge a photo-upload task into a same-question text-answer task on this slide.
+      // Materials often pair "type your answer" with "attach a photo of your work" as
+      // ONE exercise using two separate platform components. Left as two tasks, a
+      // missing photo alone scores 0 on what looks like a second copy of an
+      // otherwise-correct exercise — which then drags down the AI topic-mastery
+      // verdict in the report even though the student solved it. The photo becomes
+      // supplementary evidence on the text task instead of its own scored task.
+      // Photo tasks with no same-question text task (e.g. "show your whole solution
+      // as a photo", no separate answer field) are left standalone and still scored
+      // by the vision model as before.
+      {
+        const photoTasks = slideTasks.filter(t => t.taskType === 'photo_answer');
+        const textTasks = slideTasks.filter(t => t.taskType !== 'photo_answer');
+        const consumedPhotoIds = new Set<string>();
+
+        for (const task of textTasks) {
+          if (!task.questionText) continue;
+          const match = photoTasks.find(p =>
+            !consumedPhotoIds.has(p.componentId) && p.questionText === task.questionText);
+          if (!match) continue;
+          consumedPhotoIds.add(match.componentId);
+          const photos = match.studentAnswerStructured?.photos ?? [];
+          task.studentAnswerStructured = {
+            ...task.studentAnswerStructured,
+            photos,
+            _photoComponentId: match.componentId,
+          };
+          if (photos.length > 0) {
+            task.studentAnswer = task.studentAnswer
+              ? `${task.studentAnswer}\n[приложено фото: ${photos.length}]`
+              : `[приложено фото: ${photos.length}]`;
+          }
+        }
+
+        for (const task of textTasks) tasks.push(task);
+        for (const task of photoTasks) {
+          if (!consumedPhotoIds.has(task.componentId)) tasks.push(task);
         }
       }
 
