@@ -11,11 +11,13 @@ function formatDate(ts: string | null) {
   try { return new Date(ts).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' }) } catch { return '—' }
 }
 
-const getHistory = (params: { page: number; pageSize: number; studentId?: string; status?: string; search?: string }) => {
+const getHistory = (params: { page: number; pageSize: number; studentId?: string; status?: string; search?: string; dateFrom?: string; dateTo?: string }) => {
   const p: Record<string, string> = { page: String(params.page), pageSize: String(params.pageSize) }
   if (params.studentId) p.studentId = params.studentId
   if (params.status) p.status = params.status
   if (params.search) p.search = params.search
+  if (params.dateFrom) p.dateFrom = params.dateFrom
+  if (params.dateTo) p.dateTo = params.dateTo
   return api.get('/reports/history', { params: p }).then(r => r.data).catch(() => ({ reports: [], pagination: { total: 0, totalPages: 1, page: 1 } }))
 }
 
@@ -44,7 +46,9 @@ export default function History() {
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
   const [studentFilter, setStudentFilter] = useState('')
-  const hasFilters = !!(statusFilter || studentFilter || search)
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const hasFilters = !!(statusFilter || studentFilter || search || dateFrom || dateTo)
 
   const { data: studentsData = [] } = useQuery({
     queryKey: ['students'],
@@ -53,8 +57,8 @@ export default function History() {
   })
 
   const { data, isLoading } = useQuery({
-    queryKey: ['history', page, search, statusFilter, studentFilter],
-    queryFn: () => getHistory({ page, pageSize: 20, status: statusFilter, studentId: studentFilter, search }),
+    queryKey: ['history', page, search, statusFilter, studentFilter, dateFrom, dateTo],
+    queryFn: () => getHistory({ page, pageSize: 20, status: statusFilter, studentId: studentFilter, search, dateFrom, dateTo }),
     placeholderData: prev => prev,
     staleTime: 30_000,
   })
@@ -62,7 +66,7 @@ export default function History() {
   const reports: any[] = data?.reports ?? []
   const pagination = data?.pagination ?? { total: 0, totalPages: 1, page: 1 }
 
-  const resetFilters = () => { setSearch(''); setStatusFilter(''); setStudentFilter(''); setPage(1) }
+  const resetFilters = () => { setSearch(''); setStatusFilter(''); setStudentFilter(''); setDateFrom(''); setDateTo(''); setPage(1) }
 
   return (
     <div className="content-max fade-in">
@@ -91,6 +95,25 @@ export default function History() {
             <option value="manual_required">Ручная проверка</option>
             <option value="error">Ошибка</option>
           </select>
+          <input
+            type="date"
+            className="input"
+            style={{ width: 'auto' }}
+            value={dateFrom}
+            max={dateTo || undefined}
+            onChange={e => { setDateFrom(e.target.value); setPage(1) }}
+            title="Дата от"
+          />
+          <span style={{ color: 'var(--c-text-3)' }}>—</span>
+          <input
+            type="date"
+            className="input"
+            style={{ width: 'auto' }}
+            value={dateTo}
+            min={dateFrom || undefined}
+            onChange={e => { setDateTo(e.target.value); setPage(1) }}
+            title="Дата до"
+          />
           {hasFilters && (
             <button onClick={resetFilters} className="btn btn-ghost btn-sm">
               <X size={13} /> Сбросить

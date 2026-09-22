@@ -16,6 +16,8 @@ router.get('/history', requireAuth, async (req: AuthRequest, res: Response) => {
     const studentId = (req.query.studentId as string) || null;
     const status   = (req.query.status   as string) || null;
     const search   = (req.query.search   as string) || null;
+    const dateFrom = (req.query.dateFrom as string) || null;
+    const dateTo   = (req.query.dateTo   as string) || null;
 
     const conditions: string[] = ['ss.teacher_id = $1'];
     const params: any[] = [req.teacherId];
@@ -24,6 +26,8 @@ router.get('/history', requireAuth, async (req: AuthRequest, res: Response) => {
     if (studentId) { conditions.push(`s.id = $${idx++}`);                                                  params.push(studentId); }
     if (status)    { conditions.push(`r.status = $${idx++}`);                                              params.push(status); }
     if (search)    { conditions.push(`(cs.title ILIKE $${idx} OR cs.topic ILIKE $${idx})`); params.push(`%${search}%`); idx++; }
+    if (dateFrom)  { conditions.push(`r.generated_at >= $${idx++}::date`);                                  params.push(dateFrom); }
+    if (dateTo)    { conditions.push(`r.generated_at < ($${idx++}::date + interval '1 day')`);              params.push(dateTo); }
 
     const where = conditions.join(' AND ');
 
