@@ -132,8 +132,8 @@ export async function generateReportDocx(
 ): Promise<ReportDocResult> {
   const r = await db.query(
     `SELECT rep.id AS report_id, rep.total_score, rep.max_score, rep.percentage,
-            rep.grade AS report_grade, rep.status, rep.generated_at,
-            rep.ai_summary_for_student, rep.ai_summary_for_teacher,
+            rep.status, rep.generated_at,
+            rep.ai_summary_for_student,
             ss.id AS session_id, ss.fetched_at,
             s.full_name AS student_name,
             cs.title, cs.topic, cs.grade, cs.subject_code,
@@ -152,7 +152,7 @@ export async function generateReportDocx(
 
   const ans = await db.query(
     `SELECT a.id, a.student_answer, a.student_answer_structured, a.status, a.score,
-            a.teacher_override_score, a.ai_feedback, a.ai_teacher_note,
+            a.teacher_override_score, a.ai_feedback,
             t.question_text, t.task_type, t.reference_answer, t.slide_num, t.task_index,
             t.max_score
      FROM answers a
@@ -256,7 +256,7 @@ export async function generateReportDocx(
 
   body.push(
     para(
-      run(`Результат: ${pct}% · ${totalScore} из ${maxScore} баллов` + (rep.report_grade ? ` · оценка ${rep.report_grade}` : ''), { b: true, sz: 28 }),
+      run(`Результат: ${pct}% · ${totalScore} из ${maxScore} баллов`, { b: true, sz: 28 }),
       { spaceBefore: 200, spaceAfter: 60 },
     ),
   );
@@ -306,14 +306,10 @@ export async function generateReportDocx(
       `</w:tblBorders></w:tblPr>${mapHeader}${mapRows}</w:tbl>`,
   );
 
-  // ── ИИ-сводки ──
+  // ── ИИ-сводка для ученика ──
   if ((rep.ai_summary_for_student || '').trim()) {
     body.push(H2('Комментарий для ученика'));
     body.push(para(run(mathToText(rep.ai_summary_for_student))));
-  }
-  if ((rep.ai_summary_for_teacher || '').trim()) {
-    body.push(H2('Рекомендации учителю'));
-    body.push(para(run(mathToText(rep.ai_summary_for_teacher))));
   }
 
   // ── разбор по заданиям ──
@@ -352,9 +348,6 @@ export async function generateReportDocx(
     }
     if ((a.ai_feedback || '').trim()) {
       body.push(para(run('Комментарий проверки: ', { b: true }) + run(clip(a.ai_feedback, 1500)), { ind: 200, spaceAfter: 40 }));
-    }
-    if ((a.ai_teacher_note || '').trim()) {
-      body.push(para(run('Заметка для учителя: ', { b: true, color: 'C2410C' }) + run(clip(a.ai_teacher_note, 1200), { color: 'C2410C' }), { ind: 200, spaceAfter: 40 }));
     }
   }
 
