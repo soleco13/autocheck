@@ -195,6 +195,7 @@ async function callAIGetText(
 // called once. Cache TTL = 30 days (enforced via index, not hard delete here).
 function buildCacheKey(ctx: AICheckContext): string {
   const raw = [
+    'fb-v2', // v2: feedback_student carries «Что сделать» recommendations
     ctx.questionText.trim(),
     [...ctx.acceptable].sort().join('|'),
     ctx.answerKey.trim(),
@@ -238,6 +239,23 @@ async function setCached(key: string, result: CheckResultWithUsage): Promise<voi
       [key, result.status, result.score, result.feedbackForStudent, result.feedbackForTeacher, CHECKER_MODEL],
     );
   } catch { /* best-effort */ }
+}
+
+// ── «Что сделать» — study tips for answers that aren't fully correct ─────────
+// AI-graded answers get them from a "recommendation" field in the same call;
+// deterministic ones (quiz/matches/fill_blanks/empty/syntactic) get a small
+// separate call via addStudyTips(). The marker keeps both paths idempotent.
+const TIPS_MARKER = 'Что сделать:';
+const RECOMMENDATION_RULE =
+  `Поле "recommendation" заполняй, только если задание выполнено неверно, не полностью или не выполнено: ` +
+  `2–3 предложения ученику на «ты» — какую конкретную тему или правило повторить (назови их так, как в учебнике) ` +
+  `и как выполнять такие задания (на что обратить внимание, как себя проверить). ` +
+  `Без общих фраз вроде «будь внимательнее». Если всё верно — "recommendation": "".`;
+
+function withRecommendation(feedback: string, rec: unknown, status: string): string {
+  const r = typeof rec === 'string' ? rec.trim() : '';
+  if (status === 'correct' || !r || feedback.includes(TIPS_MARKER)) return feedback;
+  return `${feedback.trim()}\n\n${TIPS_MARKER} ${r}`;
 }
 
 interface CheckResult {
@@ -355,11 +373,13 @@ async function checkWithAI(ctx: AICheckContext, teacherId?: string): Promise<Che
   if (hasReference) {
     lines.push(`
 Сравни ответ ученика с правильным ответом по смыслу. Числа могут быть записаны по-разному (дроби, единицы измерения, лишние пробелы, запятая или точка как разделитель) — такие различия НЕ считаются ошибкой. Ответ верен, если совпадает по математическому/смысловому значению.
-Верни JSON: {"correct": true/false, "feedback_student": "краткая обратная связь ученику", "feedback_teacher": "заметка для учителя"}`);
+Верни JSON: {"correct": true/false, "feedback_student": "краткая обратная связь ученику", "recommendation": "что сделать ученику", "feedback_teacher": "заметка для учителя"}
+${RECOMMENDATION_RULE}`);
   } else {
     lines.push(`
 Оцени правильность и полноту ответа ученика по условию задания${ctx.criteria ? ' и критериям' : ''}.
-Верни JSON: {"score": 0-1 (доля правильности), "feedback_student": "краткая обратная связь ученику", "feedback_teacher": "заметка для учителя"}`);
+Верни JSON: {"score": 0-1 (доля правильности), "feedback_student": "краткая обратная связь ученику", "recommendation": "что сделать ученику", "feedback_teacher": "заметка для учителя"}
+${RECOMMENDATION_RULE}`);
   }
 
   // Throttle before calling AI — prevents 429 cascade under bulk load
@@ -383,18 +403,20 @@ async function checkWithAI(ctx: AICheckContext, teacherId?: string): Promise<Che
       status: isCorrect ? 'correct' : 'incorrect',
       score: isCorrect ? 1 : 0,
       maxScore: 1,
-      feedbackForStudent: parsed.feedback_student || (isCorrect ? 'Верно!' : 'Неверно.'),
+      feedbackForStudent: withRecommendation(parsed.feedback_student || (isCorrect ? 'Верно!' : 'Неверно.'),
+        parsed.recommendation, isCorrect ? 'correct' : 'incorrect'),
       feedbackForTeacher: parsed.feedback_teacher || '',
       usage,
     };
   } else {
     const scoreRaw: number = typeof parsed.score === 'number' ? parsed.score : 0;
     const score = Math.round(scoreRaw);
+    const status = scoreRaw >= 0.8 ? 'correct' : scoreRaw >= 0.4 ? 'partial' : 'incorrect';
     result = {
-      status: scoreRaw >= 0.8 ? 'correct' : scoreRaw >= 0.4 ? 'partial' : 'incorrect',
+      status,
       score,
       maxScore: 1,
-      feedbackForStudent: parsed.feedback_student || '',
+      feedbackForStudent: withRecommendation(parsed.feedback_student || '', parsed.recommendation, status),
       feedbackForTeacher: parsed.feedback_teacher || '',
       usage,
     };
@@ -598,7 +620,7 @@ export async function checkPhotoAnswer(answerId: string): Promise<void> {
     // Version tag ('photo-v2') — bump when prompt / scoring logic changes so stale
     // entries from an older format are not served.
     const cacheKey = crypto.createHash('sha256').update([
-      'photo-v2',
+      'photo-v3',
       questionText.trim(),
       criteria.trim(),
       answerKey.trim(),
@@ -634,8 +656,9 @@ export async function checkPhotoAnswer(answerId: string): Promise<void> {
     lines.push(`Максимальный балл за задание: ${maxScore}.`);
     lines.push(`К заданию прикреплено фото (${downloaded.length} шт.) с рукописным решением ученика. Внимательно разбери решение на фото: ход рассуждений, вычисления, итоговый ответ.`);
     lines.push(hasReference
-      ? `Верни ТОЛЬКО JSON без markdown: {"score": число от 0 до ${maxScore} (можно дробное), "correct": true/false, "feedback_student": "краткий разбор для ученика", "feedback_teacher": "заметка для учителя: что именно на фото верно/неверно"}`
-      : `Верни ТОЛЬКО JSON без markdown: {"score": число от 0 до ${maxScore} (можно дробное), "feedback_student": "краткий разбор для ученика", "feedback_teacher": "заметка для учителя: что именно на фото верно/неверно"}`);
+      ? `Верни ТОЛЬКО JSON без markdown: {"score": число от 0 до ${maxScore} (можно дробное), "correct": true/false, "feedback_student": "краткий разбор для ученика", "recommendation": "что сделать ученику", "feedback_teacher": "заметка для учителя: что именно на фото верно/неверно"}`
+      : `Верни ТОЛЬКО JSON без markdown: {"score": число от 0 до ${maxScore} (можно дробное), "feedback_student": "краткий разбор для ученика", "recommendation": "что сделать ученику", "feedback_teacher": "заметка для учителя: что именно на фото верно/неверно"}`);
+    lines.push(RECOMMENDATION_RULE);
 
     const userContent: any[] = [{ type: 'text', text: lines.join('\n') }];
     for (const img of downloaded) {
@@ -686,7 +709,9 @@ export async function checkPhotoAnswer(answerId: string): Promise<void> {
       status,
       score,
       maxScore,
-      feedbackForStudent: parsed.feedback_student || (status === 'correct' ? 'Верно!' : 'Есть ошибки, посмотри разбор.'),
+      feedbackForStudent: withRecommendation(
+        parsed.feedback_student || (status === 'correct' ? 'Верно!' : 'Есть ошибки, посмотри разбор.'),
+        parsed.recommendation, status),
       feedbackForTeacher: parsed.feedback_teacher || '',
       usage,
     };
@@ -714,6 +739,80 @@ export async function checkPhotoAnswer(answerId: string): Promise<void> {
 }
 
 export async function checkAnswer(answerId: string): Promise<void> {
+  await checkAnswerCore(answerId);
+  await addStudyTips(answerId);
+}
+
+// Appends «Что сделать: …» to an incorrect/partial answer that doesn't have it yet —
+// i.e. the deterministic paths, or an AI reply that left "recommendation" empty.
+// Best-effort: a failed AI call (e.g. no OpenRouter credits) keeps the base feedback.
+async function addStudyTips(answerId: string): Promise<void> {
+  try {
+    const r = await db.query(`
+      SELECT a.status, a.ai_feedback, a.student_answer, t.task_type, t.question_text,
+             cs.grade, cs.subject_code, cs.topic, ss.teacher_id
+      FROM answers a
+      JOIN tasks t ON t.id = a.task_id
+      JOIN control_sheets cs ON cs.id = t.control_sheet_id
+      JOIN student_sessions ss ON ss.id = a.session_id
+      WHERE a.id = $1`, [answerId]);
+    const row = r.rows[0];
+    if (!row || !['incorrect', 'partial'].includes(row.status)) return;
+    const feedback: string = row.ai_feedback || '';
+    if (feedback.includes(TIPS_MARKER)) return;
+    const question = (row.question_text || '').trim();
+    if (!question) return; // nothing concrete to base advice on
+
+    const cacheKey = crypto.createHash('sha256')
+      .update(['tips-v1', question, row.student_answer || '', feedback].join('\x00')).digest('hex');
+    let tips = (await getCached(cacheKey))?.feedbackForStudent || '';
+
+    if (!tips) {
+      const context = [
+        row.subject_code && row.subject_code !== 'XX' ? row.subject_code : '',
+        row.grade > 0 ? `${row.grade} класс` : '',
+        row.topic && row.topic !== 'Unknown' ? `тема: ${row.topic}` : '',
+      ].filter(Boolean).join(', ');
+      const userPrompt = [
+        context ? context + '.' : '',
+        `Задание: ${question}`,
+        `Ответ ученика: ${row.student_answer || '(ученик не выполнил задание)'}`,
+        `Результат проверки: ${feedback || 'неверно'}`,
+        '',
+        `Напиши ученику, что сделать, чтобы в следующий раз справиться с таким заданием. ` +
+        RECOMMENDATION_RULE.replace(/^Поле "recommendation" заполняй[^:]*: /, '').replace(/ Если всё верно.*$/, '') +
+        ` Верни только текст рекомендации, без вступлений, заголовков и markdown.`,
+      ].filter(Boolean).join('\n');
+      const systemPrompt = 'Ты — внимательный и тактичный учитель российской школы. Пиши по-русски, конкретно и доброжелательно.';
+
+      await aiThrottle.acquire();
+      const { text, usage } = await callAIGetText(userPrompt, systemPrompt, 600, getClient());
+      tips = text.replace(/^\s*(Что сделать|Рекомендаци[яи])\s*:\s*/i, '').trim();
+      if (!tips) return;
+      setCached(cacheKey, {
+        status: row.status, score: 0, maxScore: 1,
+        feedbackForStudent: tips, feedbackForTeacher: '', usage,
+      }).catch(() => {});
+      if (row.teacher_id && usage.input_tokens > 0) {
+        db.query(
+          `INSERT INTO ai_call_log (answer_id, teacher_id, model, prompt_tokens, completion_tokens)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [answerId, row.teacher_id, CHECKER_MODEL, usage.input_tokens, usage.output_tokens],
+        ).catch(() => {});
+      }
+    }
+
+    // Guard on the old text so a concurrent re-check isn't overwritten.
+    await db.query(
+      'UPDATE answers SET ai_feedback = $2 WHERE id = $1 AND ai_feedback IS NOT DISTINCT FROM $3',
+      [answerId, withRecommendation(feedback, tips, row.status), row.ai_feedback],
+    );
+  } catch (err: any) {
+    console.warn(`[study-tips] skipped for ${answerId}: ${err?.message?.slice(0, 120)}`);
+  }
+}
+
+async function checkAnswerCore(answerId: string): Promise<void> {
   const answerResult = await db.query(`
     SELECT a.*, t.task_type, t.question_text, t.reference_answer,
            cs.grade, cs.subject_code, cs.topic,
@@ -980,15 +1079,15 @@ async function callBatchAI(items: BatchItem[], teacherId?: string | null): Promi
       const ref = c.acceptable.length > 0 ? c.acceptable.join(' / ') : c.answerKey;
       lines.push(`Правильный ответ: ${ref}`);
       lines.push(`Ответ ученика: ${c.studentAnswer || '(пусто)'}`);
-      lines.push(`Формат ответа: {"i":${i},"correct":true/false,"feedback_student":"...","feedback_teacher":"..."}`);
+      lines.push(`Формат ответа: {"i":${i},"correct":true/false,"feedback_student":"...","recommendation":"...","feedback_teacher":"..."}`);
     } else {
       lines.push(`Ответ ученика: ${c.studentAnswer || '(пусто)'}`);
-      lines.push(`Формат ответа: {"i":${i},"score":0-1,"feedback_student":"...","feedback_teacher":"..."}`);
+      lines.push(`Формат ответа: {"i":${i},"score":0-1,"feedback_student":"...","recommendation":"...","feedback_teacher":"..."}`);
     }
     return lines.join('\n');
   });
 
-  const userPrompt = `Проверь ${items.length} заданий. Верни ТОЛЬКО JSON-массив, без текста до или после него.\n\n${blocks.join('\n\n')}`;
+  const userPrompt = `Проверь ${items.length} заданий. Верни ТОЛЬКО JSON-массив, без текста до или после него.\n${RECOMMENDATION_RULE}\n\n${blocks.join('\n\n')}`;
   // Each item needs ~300 tokens for JSON + ~800 thinking overhead
   const batchMaxTokens = Math.max(2048, 800 * items.length);
 
@@ -1069,16 +1168,18 @@ async function callBatchAI(items: BatchItem[], teacherId?: string | null): Promi
       result = {
         status: isCorrect ? 'correct' : 'incorrect',
         score: isCorrect ? 1 : 0, maxScore: 1,
-        feedbackForStudent: obj.feedback_student || (isCorrect ? 'Верно!' : 'Неверно.'),
+        feedbackForStudent: withRecommendation(obj.feedback_student || (isCorrect ? 'Верно!' : 'Неверно.'),
+          obj.recommendation, isCorrect ? 'correct' : 'incorrect'),
         feedbackForTeacher: obj.feedback_teacher || '',
         usage: { input_tokens: 0, output_tokens: 0 },
       };
     } else {
       const scoreRaw = typeof obj.score === 'number' ? obj.score : 0;
+      const status = scoreRaw >= 0.8 ? 'correct' : scoreRaw >= 0.4 ? 'partial' : 'incorrect';
       result = {
-        status: scoreRaw >= 0.8 ? 'correct' : scoreRaw >= 0.4 ? 'partial' : 'incorrect',
+        status,
         score: Math.round(scoreRaw), maxScore: 1,
-        feedbackForStudent: obj.feedback_student || '',
+        feedbackForStudent: withRecommendation(obj.feedback_student || '', obj.recommendation, status),
         feedbackForTeacher: obj.feedback_teacher || '',
         usage: { input_tokens: 0, output_tokens: 0 },
       };
@@ -1166,6 +1267,7 @@ export async function checkAnswersBatch(
         'UPDATE answers SET status=$1, score=0, ai_feedback=$2 WHERE id=$3',
         ['incorrect', 'Ответ не заполнен.', answer.id],
       );
+      await addStudyTips(answer.id);
       progress(); continue;
     }
 
@@ -1201,6 +1303,7 @@ export async function checkAnswersBatch(
           [syntactic ? 'correct' : 'incorrect', syntactic ? 1 : 0,
            syntactic ? 'Соответствует критерию задания.' : 'Не соответствует критерию задания.', answer.id],
         );
+        if (!syntactic) await addStudyTips(answer.id);
         progress(); continue;
       }
     }

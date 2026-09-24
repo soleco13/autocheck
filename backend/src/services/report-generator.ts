@@ -132,7 +132,7 @@ export async function generateReport(sessionId: string): Promise<string> {
             `  Ответ ученика: ${clean(a.student_answer, 1200) || '—'}`,
           ];
           if (a.reference_answer) lines.push(`  Эталонный ответ: ${clean(a.reference_answer, 400)}`);
-          if (a.ai_feedback) lines.push(`  Что показала проверка: ${clean(a.ai_feedback, 700)}`);
+          if (a.ai_feedback) lines.push(`  Что показала проверка: ${clean(a.ai_feedback, 1100)}`);
           if (a.ai_teacher_note) lines.push(`  Заметка для учителя: ${clean(a.ai_teacher_note, 500)}`);
           return lines.join('\n');
         })
