@@ -25,6 +25,7 @@ TLS_DAYS_MIN=10
 BACKUP_MAX_AGE_H=26
 QUEUE_WAITING_MAX=25          # backlog size that counts as "stuck" ...
 QUEUE_WAITING_STUCK_SEC=900   # ... only if it stays above that this long
+AI_BALANCE_MIN_USD=5          # OpenRouter credits below this → alert
 REMIND_SEC=21600             # re-notify a still-failing check every 6h
 
 TS="[$(date -Iseconds)]"
@@ -69,6 +70,16 @@ else
     fi
   else
     rm -f "$MARK"
+  fi
+fi
+
+# ---------- OpenRouter balance (AI checks stop with HTTP 402 at $0) ----------
+ORKEY=$(grep -m1 '^OPENROUTER_API_KEY=' .env 2>/dev/null | cut -d= -f2- | tr -d '"'"'"'\r')
+if [ -n "$ORKEY" ]; then
+  CJSON=$(curl -fsS -m 10 -H "Authorization: Bearer $ORKEY" https://openrouter.ai/api/v1/credits 2>/dev/null)
+  BAL=$(jq -r '(.data.total_credits - .data.total_usage) // empty' <<<"$CJSON" 2>/dev/null)
+  if [ -n "$BAL" ] && awk -v b="$BAL" -v m="$AI_BALANCE_MIN_USD" 'BEGIN{exit !(b < m)}'; then
+    CUR[ai_balance]="баланс OpenRouter $(printf '%.2f' "$BAL") \$ (< ${AI_BALANCE_MIN_USD} \$) — пополни https://openrouter.ai/settings/credits"
   fi
 fi
 

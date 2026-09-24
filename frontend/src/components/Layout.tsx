@@ -4,9 +4,9 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Users, BookOpen, BookMarked, History, Settings, Home,
   Search, HelpCircle, LogOut, PanelLeft, X, Square, Menu,
-  AlertTriangle, Activity,
+  AlertTriangle, Activity, Wallet,
 } from 'lucide-react'
-import { getMe, getStudents, logout, getPlatformStatus } from '../api/client'
+import { getMe, getStudents, logout, getPlatformStatus, getAiBalance } from '../api/client'
 import { toast } from './Toast'
 import { AppLogo } from './AppLogo'
 import { useCheckContext } from '../context/CheckContext'
@@ -71,6 +71,29 @@ export default function Layout() {
   })
   const platformStatus: string = platformData?.status ?? 'ok'
   const platformEnabled: boolean = platformData?.enabled ?? false
+
+  const { data: aiBalance } = useQuery({
+    queryKey: ['ai-balance'],
+    queryFn: getAiBalance,
+    refetchInterval: 5 * 60_000,
+    staleTime: 4 * 60_000,
+    retry: false,
+  })
+  const balance: number | undefined = aiBalance?.balance
+  const balanceLevel = balance === undefined ? 'ok' : balance < 3 ? 'critical' : balance < 10 ? 'low' : 'ok'
+  const BALANCE_COLORS = {
+    ok:       { bg: 'var(--c-surface-2)', border: 'var(--c-border-solid)', fg: 'var(--c-text-2)' },
+    low:      { bg: '#fffbeb', border: '#fde68a', fg: '#d97706' },
+    critical: { bg: '#fef2f2', border: '#fecaca', fg: '#dc2626' },
+  }[balanceLevel]
+  const balanceTitle = aiBalance
+    ? [
+        `Баланс OpenRouter (ИИ-проверки): $${aiBalance.balance.toFixed(2)}`,
+        `Расход: сегодня $${aiBalance.usageDaily.toFixed(2)}, за 7 дней $${aiBalance.usageWeekly.toFixed(2)}, за месяц $${aiBalance.usageMonthly.toFixed(2)}`,
+        aiBalance.daysLeft != null ? `Хватит примерно на ${Math.floor(aiBalance.daysLeft)} дн.` : '',
+        balanceLevel === 'critical' ? 'Баланс почти исчерпан — ИИ-проверки могут не работать' : '',
+      ].filter(Boolean).join('\n')
+    : ''
 
   const { bulkChecks, stopBulkCheck, stopAllBulkChecks } = useCheckContext()
   const activeBulk = [...bulkChecks.values()]
@@ -161,6 +184,28 @@ export default function Layout() {
               {platformStatus === 'overloaded' ? 'Перегружена' : 'Медленно'}
             </span>
           </button>
+        )}
+
+        {/* OpenRouter balance — visible to every teacher */}
+        {balance !== undefined && (
+          <div
+            title={balanceTitle}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              padding: '5px 10px', borderRadius: 10, fontSize: 13, fontWeight: 600,
+              background: BALANCE_COLORS.bg, border: `1px solid ${BALANCE_COLORS.border}`,
+              color: BALANCE_COLORS.fg, whiteSpace: 'nowrap', cursor: 'default',
+              animation: balanceLevel === 'critical' ? 'pulse 2s ease-in-out infinite' : 'none',
+            }}
+          >
+            <Wallet size={15} />
+            <span>${balance.toFixed(2)}</span>
+            {aiBalance.daysLeft != null && (
+              <span className="help-label" style={{ fontWeight: 500, opacity: 0.8 }}>
+                · ~{Math.floor(aiBalance.daysLeft)} дн.
+              </span>
+            )}
+          </div>
         )}
 
         {/* Global search */}

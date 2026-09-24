@@ -13,6 +13,54 @@ router.get('/status', requireAuth, (_req, res) => {
   res.json({ status: getMontiStatus(), metrics: getMontiMetrics(), enabled: isMontiEnabled() });
 });
 
+// ── OpenRouter balance ────────────────────────────────────────────────────
+// Shown to every teacher in the header. Cached for 5 min so page loads don't hammer OpenRouter.
+const BALANCE_TTL_MS = 5 * 60_000;
+let balanceCache: { at: number; data: any } | null = null;
+
+async function fetchOpenRouter(path: string, apiKey: string): Promise<any> {
+  const r = await fetch(`https://openrouter.ai/api/v1${path}`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!r.ok) throw new Error(`OpenRouter ${path} → HTTP ${r.status}`);
+  return ((await r.json()) as any).data;
+}
+
+router.get('/balance', requireAuth, async (_req, res) => {
+  if (balanceCache && Date.now() - balanceCache.at < BALANCE_TTL_MS)
+    return res.json(balanceCache.data);
+
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'OPENROUTER_API_KEY не настроен' });
+
+  try {
+    const [credits, key] = await Promise.all([
+      fetchOpenRouter('/credits', apiKey),
+      fetchOpenRouter('/key', apiKey),
+    ]);
+    const balance = Math.max(0, credits.total_credits - credits.total_usage);
+    const avgDaily = (key.usage_weekly ?? 0) / 7;
+    const data = {
+      balance,
+      totalCredits: credits.total_credits,
+      usageDaily:   key.usage_daily ?? 0,
+      usageWeekly:  key.usage_weekly ?? 0,
+      usageMonthly: key.usage_monthly ?? 0,
+      avgDaily,
+      daysLeft: avgDaily > 0 ? balance / avgDaily : null,
+      updatedAt: new Date().toISOString(),
+    };
+    balanceCache = { at: Date.now(), data };
+    res.json(data);
+  } catch (err: any) {
+    logger.warn({ err: err.message }, '[platform] OpenRouter balance fetch failed');
+    // Serve stale data rather than nothing if we have it.
+    if (balanceCache) return res.json({ ...balanceCache.data, stale: true });
+    res.status(502).json({ error: 'Не удалось получить баланс OpenRouter' });
+  }
+});
+
 router.post('/report', requireAuth, async (_req, res) => {
   if (!isMontiEnabled())
     return res.status(503).json({ error: 'Мониторинг платформы не настроен' });

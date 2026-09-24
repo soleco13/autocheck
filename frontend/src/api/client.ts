@@ -299,6 +299,9 @@ export const saveAiPrompt = (key: string, text: string) =>
 export const getPlatformStatus = () =>
   api.get('/platform/status').then(r => r.data)
 
+export const getAiBalance = () =>
+  api.get('/platform/balance').then(r => r.data)
+
 export const getPlatformReport = () =>
   api.post('/platform/report').then(r => r.data)
 
