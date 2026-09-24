@@ -3,6 +3,7 @@ import { loadImage } from '@napi-rs/canvas';
 import { db } from '../db';
 import { logger } from '../lib/logger';
 import { SUBJECT_BY_CODE } from './kp-generator';
+import { isHeic, heicToJpeg } from '../lib/heic';
 
 /**
  * Экспорт страницы отчёта о проверке в .docx.
@@ -199,9 +200,13 @@ export async function generateReportDocx(
     try {
       const resp = await fetch(url, { signal: AbortSignal.timeout(12_000) });
       if (!resp.ok) return null;
-      const ct = (resp.headers.get('content-type') || '').toLowerCase();
+      let ct = (resp.headers.get('content-type') || '').toLowerCase();
+      let buf: Buffer = Buffer.from(await resp.arrayBuffer());
+      // Word can't embed HEIC (iPhone photos) — transcode to JPEG.
+      if (isHeic(buf, ct)) {
+        try { buf = await heicToJpeg(buf); ct = 'image/jpeg'; } catch { return null; }
+      }
       const ext = ct.includes('png') ? 'png' : ct.includes('webp') ? 'webp' : 'jpeg';
-      const buf = Buffer.from(await resp.arrayBuffer());
       if (buf.length > imgBudget) return null;
       imgBudget -= buf.length;
 

@@ -6,6 +6,7 @@ import { DEFAULT_PROMPTS } from '../api/settings';
 import { configStore } from '../lib/config-store';
 import { getOpenRouterClient, getOpenRouterVisionClient } from '../lib/openrouter-client';
 import { retrieveChunks, checkRagAvailability, checkRagStatus } from './rag-retriever';
+import { isHeic, heicToJpeg } from '../lib/heic';
 
 const CHECKER_MODEL  = process.env.AI_CHECKER_MODEL  || 'anthropic/claude-haiku-4.5';
 const FALLBACK_MODEL = process.env.AI_FALLBACK_MODEL || 'openai/gpt-5-mini';
@@ -108,6 +109,37 @@ function extractJSON(raw: string, opener: '{' | '['): string {
     if (ok) return clean.slice(i);
   }
   return clean;
+}
+
+// Vision replies are long multi-line prose inside JSON strings; models sometimes
+// emit raw newlines/tabs there (invalid JSON) or trail a sentence after the '}'.
+// Repair just those two things before giving up on an otherwise readable answer.
+function parseLenientJSON(raw: string): any {
+  const src = extractJSON(raw, '{');
+  try { return JSON.parse(src); } catch { /* repair below */ }
+  let out = '';
+  let inStr = false;
+  let esc = false;
+  let depth = 0;
+  let end = -1;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (inStr) {
+      if (esc) { esc = false; out += c; continue; }
+      if (c === '\\') { esc = true; out += c; continue; }
+      if (c === '"') { inStr = false; out += c; continue; }
+      if (c === '\n') { out += '\\n'; continue; }
+      if (c === '\r') { continue; }
+      if (c === '\t') { out += '\\t'; continue; }
+      out += c;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{') depth++;
+    else if (c === '}' && --depth === 0) { out += c; end = out.length; break; }
+    out += c;
+  }
+  return JSON.parse(end > 0 ? out.slice(0, end) : out);
 }
 
 export async function callGPTFallback(userPrompt: string, systemPrompt: string, maxTokens: number): Promise<string> {
@@ -470,6 +502,17 @@ async function fetchPhotoAsDataUrl(url: string): Promise<{ dataUrl: string; sha:
     return null;
   }
   let ct = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  // Cache key uses the ORIGINAL bytes so re-checks keep hitting the same entry.
+  const sha = crypto.createHash('sha256').update(buf).digest('hex');
+  if (isHeic(buf, ct)) {
+    try {
+      const jpeg = await heicToJpeg(buf);
+      return { dataUrl: `data:image/jpeg;base64,${jpeg.toString('base64')}`, sha };
+    } catch (err: any) {
+      // Fall through and send the HEIC as-is — some vision models read it natively.
+      console.warn(`[photo-checker] HEIC→JPEG failed, sending original: ${err?.message}`);
+    }
+  }
   if (!ct.startsWith('image/')) {
     // Some file stores serve images as octet-stream — infer from magic bytes.
     if (buf[0] === 0xff && buf[1] === 0xd8) ct = 'image/jpeg';
@@ -477,7 +520,6 @@ async function fetchPhotoAsDataUrl(url: string): Promise<{ dataUrl: string; sha:
     else if (buf[0] === 0x52 && buf[1] === 0x49) ct = 'image/webp';
     else ct = 'image/jpeg';
   }
-  const sha = crypto.createHash('sha256').update(buf).digest('hex');
   return { dataUrl: `data:${ct};base64,${buf.toString('base64')}`, sha };
 }
 
@@ -604,7 +646,9 @@ export async function checkPhotoAnswer(answerId: string): Promise<void> {
     const client = getOpenRouterVisionClient();
     const response = await client.chat.completions.create({
       model: VISION_MODEL,
-      max_tokens: 1500,
+      // Detailed per-step feedback on multi-photo answers ran past 1500 and got
+      // cut mid-JSON → "ИИ не смог разобрать фото" on a readable photo.
+      max_tokens: 3000,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent },
@@ -618,7 +662,7 @@ export async function checkPhotoAnswer(answerId: string): Promise<void> {
 
     let parsed: any;
     try {
-      parsed = JSON.parse(extractJSON(text, '{'));
+      parsed = parseLenientJSON(text);
     } catch {
       await setAnswerResult(answerId, 'manual_required', 0,
         'ИИ не смог разобрать фото — нужна ручная проверка.',

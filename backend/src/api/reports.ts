@@ -4,6 +4,7 @@ import { db } from '../db';
 import { z } from 'zod';
 import { safeError } from '../lib/safe-error';
 import { audit } from '../lib/audit';
+import { isHeic, heicToJpeg } from '../lib/heic';
 
 const router = Router();
 
@@ -137,8 +138,12 @@ router.get('/answers/:answerId/photo/:idx', requireAuth, async (req: AuthRequest
     if (!upstream.ok) { res.status(502).end(); return; }
 
     let ct = (upstream.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    let buf: Buffer = Buffer.from(await upstream.arrayBuffer());
+    // iPhone HEIC renders only in Safari — serve JPEG so every browser shows it.
+    if (isHeic(buf, ct)) {
+      try { buf = await heicToJpeg(buf); ct = 'image/jpeg'; } catch { /* serve original */ }
+    }
     if (!ct.startsWith('image/')) ct = 'image/jpeg';
-    const buf = Buffer.from(await upstream.arrayBuffer());
 
     res.setHeader('Content-Type', ct);
     res.setHeader('Cache-Control', 'private, max-age=3600');
