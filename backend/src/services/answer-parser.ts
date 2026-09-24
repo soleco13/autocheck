@@ -79,6 +79,60 @@ function stripHtmlForAI(html: string): string {
   return result.replace(/\s+/g, ' ').trim();
 }
 
+export interface MatchPairCheck {
+  what: string;       // item the student had to place
+  placed: string | null; // label of the box it ended up in (null = not placed)
+  expected: string;   // label(s) of the box(es) the author's rule accepts
+  correct: boolean;
+}
+
+// Grades a matching mechanic pair-by-pair against the author's rulesChecker.
+// Boxes are compared by LABEL, not id: materials sometimes contain two boxes with
+// the same caption and the rule points at only one of them — the platform then
+// rejects a semantically correct answer. Returns null when rules are unreadable.
+function checkMatchesPairs(
+  comp: any,
+  byWhat: Record<string, string>,
+  objById: Map<string, any>,
+  CText: any,
+): MatchPairCheck[] | null {
+  const rules: any[] = comp?.rulesChecker?.rules;
+  if (!Array.isArray(rules) || rules.length === 0) return null;
+
+  const idOf = (x: any): string => (typeof x === 'string' ? x : x?.id);
+  const labelOf = (id: string): string => {
+    const t = objById.get(id)?.getComponent?.(CText)?.text;
+    return t ? stripHtml(t) : id;
+  };
+  const norm = (s: string) => s.toLowerCase().replace(/ё/g, 'е').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+
+  const result: MatchPairCheck[] = [];
+  const seen = new Set<string>();
+  for (const rule of rules) {
+    const whats: string[] = (rule?.whatObjs || []).map(idOf).filter(Boolean);
+    const withs: string[] = (rule?.withObjs || []).map(idOf).filter(Boolean);
+    if (withs.length === 0) continue;
+    const expectedLabels = withs.map(labelOf);
+    const expectedNorm = new Set(expectedLabels.map(norm));
+    for (const whatId of whats) {
+      if (seen.has(whatId)) continue;
+      seen.add(whatId);
+      const placedId = byWhat[whatId];
+      const placed = placedId ? labelOf(placedId) : null;
+      result.push({
+        what: labelOf(whatId),
+        placed,
+        expected: expectedLabels.join(' / '),
+        correct: !!placedId && (withs.includes(placedId) || expectedNorm.has(norm(placed!))),
+      });
+    }
+  }
+  // Placed items no rule mentions (distractors / optionalObjs) — semantics unclear,
+  // so don't second-guess the platform: fall back to its verdict.
+  if (Object.keys(byWhat).some(id => !seen.has(id))) return null;
+  return result.length > 0 ? result : null;
+}
+
 export interface SlideContext {
   problem: string;      // the actual task condition shown to the student
   instruction: string;  // format instruction ("Введи только число...")
@@ -537,6 +591,12 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
                 return `${lt} → ${rt}`;
               });
               const mCtx = getSlideContext(slide, obj, CText);
+              // Platform isSolved compares boxes by id, so a material with two identically
+              // labelled boxes fails a correct answer — the label-based check can only
+              // upgrade the verdict, never downgrade a platform "solved".
+              const pairCheck = checkMatchesPairs(comp, byWhat, objById, CText);
+              const platformSolved: boolean | null = secResult?.isSolved ?? null;
+              const localSolved: boolean | null = pairCheck ? pairCheck.every(p => p.correct) : null;
               tasks.push({
                 componentId: comp.id,
                 taskType: 'matches',
@@ -544,7 +604,9 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
                 studentAnswer: pairs.join('\n'),
                 studentAnswerStructured: {
                   ...saved,
-                  _isSolved: secResult?.isSolved ?? null,
+                  _isSolved: platformSolved === true ? true : (localSolved ?? platformSolved),
+                  _platformIsSolved: platformSolved,
+                  _pairs: pairCheck,
                   _slideNum: slideNum,
                   _slideProblem: mCtx.problem || null,
                   _answerKey: mCtx.answerKey || null,

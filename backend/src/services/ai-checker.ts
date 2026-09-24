@@ -727,12 +727,27 @@ export async function checkAnswer(answerId: string): Promise<void> {
     }
 
     if (isSolved !== null) {
+      // Per-pair verdict from the parser (matches only) — name the exact wrong pairs so
+      // the report model has something concrete instead of inventing an error.
+      const pairs: Array<{ what: string; placed: string | null; expected: string; correct: boolean }> =
+        Array.isArray(structured?._pairs) ? structured._pairs : [];
+      const wrong = pairs.filter(p => !p.correct);
+      let feedback = isSolved ? `Задание на ${label} выполнено верно.` : `Задание на ${label} выполнено неверно.`;
+      if (!isSolved && wrong.length > 0) {
+        feedback = `Задание на ${label}: верно ${pairs.length - wrong.length} из ${pairs.length}. Ошибки: ` +
+          wrong.map(p => `«${p.what}» → ${p.placed ? `«${p.placed}»` : 'не размещено'} (правильно: «${p.expected}»)`).join('; ') + '.';
+      }
+      const teacherNote = isSolved && structured?._platformIsSolved === false
+        ? 'Платформа отметила задание как нерешённое, но все пары совпадают с ключом по названиям — ' +
+          'вероятно, в материале есть одинаковые ячейки-ответы. Засчитано как верное.'
+        : null;
       await db.query(
-        'UPDATE answers SET status = $1, score = $2, ai_feedback = $3 WHERE id = $4',
+        'UPDATE answers SET status = $1, score = $2, ai_feedback = $3, ai_teacher_note = $4 WHERE id = $5',
         [
           isSolved ? 'correct' : 'incorrect',
           isSolved ? 1 : 0,
-          isSolved ? `Задание на ${label} выполнено верно.` : `Задание на ${label} выполнено неверно.`,
+          feedback,
+          teacherNote,
           answerId,
         ]
       );

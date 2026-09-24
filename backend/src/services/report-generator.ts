@@ -127,7 +127,9 @@ export async function generateReport(sessionId: string): Promise<string> {
           const lines = [
             `Задание ${num} — ${typeRu}. Результат: ${STATUS_RU[a.status] || a.status}, балл ${eff ?? 0} из ${a.max_score || 1}`,
             `  Условие: ${clean(a.question_text, 600) || '—'}`,
-            `  Ответ ученика: ${clean(a.student_answer, 400) || '—'}`,
+            // Matching answers list every pair (≈40 chars each) — 400 cut the tail off
+            // and the report model "found" errors in pairs it never saw.
+            `  Ответ ученика: ${clean(a.student_answer, 1200) || '—'}`,
           ];
           if (a.reference_answer) lines.push(`  Эталонный ответ: ${clean(a.reference_answer, 400)}`);
           if (a.ai_feedback) lines.push(`  Что показала проверка: ${clean(a.ai_feedback, 700)}`);
@@ -150,13 +152,18 @@ export async function generateReport(sessionId: string): Promise<string> {
       const studentContext = `КОНТЕКСТ РАБОТЫ\n${commonContext}`;
       const teacherContext = `КОНТЕКСТ РАБОТЫ\n${commonContext} Предварительная оценка: ${grade}.`;
 
+      const noInventRule =
+        'ВАЖНО: называй ошибку только если она прямо указана в «Что показала проверка» или видна из сравнения ' +
+        'с эталоном. Если задание помечено как ошибка, но конкретная ошибка не указана — не придумывай её, ' +
+        'просто скажи, что задание стоит перепроверить.';
+
       const summaryPrompt =
         `${studentPromptBase}\n\n${studentContext}\n\n` +
-        `РАЗБОР ПО ЗАДАНИЯМ (это исходные данные для тебя — опирайся только на них):\n\n${taskBreakdown}`;
+        `РАЗБОР ПО ЗАДАНИЯМ (это исходные данные для тебя — опирайся только на них):\n\n${taskBreakdown}\n\n${noInventRule}`;
 
       const teacherSummaryPrompt =
         `${teacherPromptBase}\n\n${teacherContext}\n\n` +
-        `РАЗБОР ПО ЗАДАНИЯМ:\n\n${taskBreakdown}`;
+        `РАЗБОР ПО ЗАДАНИЯМ:\n\n${taskBreakdown}\n\n${noInventRule}`;
 
       const topicsPrompt =
         `${topicsPromptBase}\n\n${studentContext}\n\n` +
