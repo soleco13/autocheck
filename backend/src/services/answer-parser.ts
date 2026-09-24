@@ -84,11 +84,14 @@ export interface SlideContext {
   instruction: string;  // format instruction ("Введи только число...")
   answerKey: string;    // teacher answer key extracted from criteria ("Ответы: 1530")
   criteria: string;     // grading criteria text (teacher-facing)
+  revealNotes?: string[];  // per-Note reference answers ("Проверь себя"/hint blocks), in slide order
+  revealIsKey?: boolean;   // true when answerKey came from reveal notes (no explicit "Ответы:" key)
+  hiddenIds?: Set<string>; // ids of teacher-only / self-check reveal blocks (never part of the problem)
 }
 
 // Generic UI labels / button captions that carry no task meaning.
 const GENERIC_LABELS = new Set([
-  'проверить', 'пройти еще раз', 'пройти ещё раз', 'отправить', 'ответ', 'ответ:',
+  'проверить', 'проверь себя', 'пройти еще раз', 'пройти ещё раз', 'отправить', 'ответ', 'ответ:',
   'введи ответ', 'answer', 'answer:', 'я готов!', 'я готов', 'проверено', 'проверено ✔',
   'ожидаем..', 'ожидаем...', '',
 ]);
@@ -104,12 +107,43 @@ function getSlideContext(slide: any, mechObj: any | null, CText: any): SlideCont
   let answerKey = '';
   const criteriaParts: string[] = [];
 
+  // 0) Note callouts hold text that is NOT the task condition. slide.objects is flat, so a
+  //    Note's inner lines ("1: 40", "Это величина…") show up as ordinary root texts and would
+  //    leak into the problem (and from there into student-facing reports):
+  //    - teacher notes ("Комментарий для учителя", "Критерии оценивания") → criteria only
+  //    - "Проверь себя" reveal notes (slide has such a button) → reference answer only
+  const textOf = (o: any): string => {
+    const t = o?.getComponent?.(CText)?.text;
+    return t ? stripHtml(t) : '';
+  };
+  const hasSelfCheckButton = slide.objects.some((o: any) => /^проверь себя/i.test(textOf(o)));
+  const hiddenIds = new Set<string>();
+  const revealParts: string[] = [];
+  const revealNotes: string[] = [];
+  const hasOpenAnswer = slide.objects.some((o: any) => o.tag === 'open_answer_answer_input');
+  for (const o of slide.objects) {
+    if (o.name !== 'Note' || hiddenIds.has(o.id)) continue;
+    const members = [o, ...(o.getDeepChildren?.() || [])];
+    const texts = members.map(textOf).filter((t) => /[\p{L}\p{N}]/u.test(t));
+    const joined = texts.join(' ');
+    const isTeacher = /комментарий для учителя|критерии оценивания/i.test(joined);
+    if (!isTeacher && !hasSelfCheckButton && !hasOpenAnswer) continue;
+    for (const m of members) hiddenIds.add(m.id);
+    if (isTeacher) {
+      if (!/критерии оценивания/i.test(joined)) criteriaParts.push(texts.join('\n'));
+    } else {
+      revealParts.push(...texts);
+      revealNotes.push(texts.join('\n'));
+    }
+  }
+
   // 1) Collect task text → problem / instruction. slide.objects is a FLAT list (it also
   //    contains the mechanic sub-parts: quiz_variant options, matches_what/with items,
   //    answer labels and buttons). Keep only plain text blocks and "*_question_text"
   //    prompts; drop option/button/answer-label parts so they never pollute the problem.
   for (const rootObj of slide.objects) {
     if (mechObj && (rootObj === mechObj || rootObj.id === mechObj.id)) continue;
+    if (hiddenIds.has(rootObj.id)) continue;
     const tag: string = rootObj.tag || '';
     const isMechanicPart = /^(quiz_|matches_|check_value_|input_)/.test(tag);
     const isQuestionPrompt = /_question_text$/.test(tag);
@@ -140,11 +174,19 @@ function getSlideContext(slide: any, mechObj: any | null, CText: any): SlideCont
     }
   }
 
+  // Self-check reveal text is the reference answer for open questions (unless an explicit
+  // "Ответы:" key exists) — keep it for the AI checker, out of the visible problem text.
+  const revealIsKey = !answerKey && revealParts.length > 0;
+  if (!answerKey && revealParts.length > 0) answerKey = [...new Set(revealParts)].join('\n');
+
   return {
     problem: [...new Set(problemParts)].join('\n'),
     instruction,
     answerKey,
     criteria: [...new Set(criteriaParts)].join('\n'),
+    revealNotes,
+    revealIsKey,
+    hiddenIds,
   };
 }
 
@@ -168,23 +210,24 @@ function parseAllDropdownItems(html: string): Array<{ questionText: string; corr
   return items;
 }
 
-function getQuestionText(obj: any, CText: any): string {
+function getQuestionText(obj: any, CText: any, hiddenIds?: Set<string>): string {
+  const usable = (t: string) => !!t && /[\p{L}\p{N}]/u.test(t); // skip pure-symbol text (e.g. "💡")
   let cur = obj;
   for (let i = 0; i < 5; i++) {
     if (!cur) break;
-    const comp = cur.getComponent(CText);
+    const comp = hiddenIds?.has(cur.id) ? null : cur.getComponent(CText);
     if (comp?.text) {
       const t = stripHtml(comp.text);
-      if (t) return t;
+      if (usable(t)) return t;
     }
     if (cur.parent && i > 0) {
       const siblings = cur.parent.getDeepChildren?.() || [];
       for (const sib of siblings) {
-        if (sib === cur) continue;
+        if (sib === cur || hiddenIds?.has(sib.id)) continue;
         const sc = sib.getComponent?.(CText);
         if (sc?.text) {
           const t = stripHtml(sc.text);
-          if (t) return t;
+          if (usable(t)) return t;
         }
       }
     }
@@ -364,6 +407,16 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
       // otherwise-correct exercise — see merge pass below.
       const slideTasks: ParsedTask[] = [];
 
+      // A CheckValue mechanic stacks N questions that share one slide condition; the per-field
+      // labels ("∠AOX", "∠BOX", …) are the only thing telling the N inputs apart.
+      const cvLabels: string[] = slide.objects
+        .filter((o: any) => o.tag === 'check_value_question_text')
+        .map((o: any) => { const t = o.getComponent?.(CText)?.text; return t ? stripHtml(t) : ''; });
+      let cvInputIdx = 0;
+      // Same idea for stacked OpenAnswer mechanics: each part has its own reveal Note, in order.
+      const openInputCount = slide.objects.filter((o: any) => o.tag === 'open_answer_answer_input').length;
+      let openInputIdx = 0;
+
       for (const rootObj of slide.objects) {
         const allObjs: any[] = [rootObj, ...rootObj.getDeepChildren()];
 
@@ -377,7 +430,7 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
               processedFileLoaderIds.add(flId);
               const photos = photoMap.get(flId) ?? [];
               const ctx = getSlideContext(slide, null, CText);
-              let hint = getQuestionText(obj, CText);
+              let hint = getQuestionText(obj, CText, ctx.hiddenIds);
               if (hint && GENERIC_LABELS.has(hint.toLowerCase().trim())) hint = '';
               let questionText = ctx.problem;
               if (hint && hint !== ctx.problem && !ctx.problem.includes(hint)) {
@@ -426,16 +479,28 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
               // Full slide context: problem condition, format instruction, answer key, criteria.
               const ctx = getSlideContext(slide, null, CText);
               // Per-input hint/label (e.g. "Введи значение числителя дроби из ответа").
-              let hint = getQuestionText(obj, CText);
+              let hint = getQuestionText(obj, CText, ctx.hiddenIds);
               if (hint && GENERIC_LABELS.has(hint.toLowerCase().trim())) hint = '';
               // Question text = slide problem + specific hint (when it adds information).
               let questionText = ctx.problem;
               if (hint && hint !== ctx.problem && !ctx.problem.includes(hint)) {
                 questionText = ctx.problem ? `${ctx.problem}\n${hint}` : hint;
               }
+              if (obj.tag === 'check_value_answer_input' && cvLabels.length > 1) {
+                const label = cvLabels[cvInputIdx];
+                questionText = `${questionText}\n[Поле ${cvInputIdx + 1} из ${cvLabels.length}${label ? `: ${label}` : ''}]`;
+                cvInputIdx++;
+              }
               const hasImage = CImage && (obj.getComponent?.(CImage) || obj.parent?.getComponent?.(CImage));
               if (!questionText && hasImage) questionText = '[задание с изображением]';
               else if (hasImage) questionText = `${questionText} [есть изображение]`;
+
+              let partKey = ctx.answerKey;
+              if (obj.tag === 'open_answer_answer_input') {
+                const notes = ctx.revealNotes ?? [];
+                if (ctx.revealIsKey && openInputCount > 1 && notes.length === openInputCount) partKey = notes[openInputIdx];
+                openInputIdx++;
+              }
 
               slideTasks.push({
                 componentId: inputId,
@@ -446,7 +511,7 @@ export async function parseRawState(rawState: any): Promise<ParsedTask[]> {
                   _slideNum: slideNum,
                   _slideProblem: ctx.problem || null,
                   _instruction: ctx.instruction || null,
-                  _answerKey: ctx.answerKey || null,
+                  _answerKey: partKey || null,
                   _criteria: ctx.criteria || null,
                   _acceptableAnswers: acceptable || null,
                 },
